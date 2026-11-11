@@ -1,0 +1,33 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global Catch-All Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Reusable standard validation helpers
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // 2. Accounts rules
+    match /accounts/{email} {
+      allow read, write: if true;
+    }
+
+    // 3. Assessments rules
+    match /assessments/{assessmentId} {
+      allow read, write: if true;
+    }
+
+    // 4. Candidates rules
+    match /candidates/{candidateId} {
+      allow read, write: if true;
+    }
+  }
+}

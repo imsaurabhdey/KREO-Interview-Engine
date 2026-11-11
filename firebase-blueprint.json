@@ -1,0 +1,107 @@
+{
+  "entities": {
+    "UserAccount": {
+      "title": "UserAccount",
+      "description": "User database of recruiters and administrators with hashed passwords.",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "email": { "type": "string" },
+        "passwordHash": { "type": "string" },
+        "role": { "type": "string", "enum": ["Admin", "Recruiter"] },
+        "orgName": { "type": "string" }
+      },
+      "required": ["name", "email", "passwordHash", "role", "orgName"]
+    },
+    "Question": {
+      "title": "Question",
+      "description": "An individual interview challenge (HR, Tech, or Interactive Coding).",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "category": { "type": "string", "enum": ["hr", "tech", "coding"] },
+        "question": { "type": "string" },
+        "difficulty": { "type": "string", "enum": ["Easy", "Moderate", "High"] },
+        "suggestedAnswer": { "type": "string" },
+        "targetedSkill": { "type": "string" }
+      },
+      "required": ["id", "category", "question", "difficulty"]
+    },
+    "Assessment": {
+      "title": "Assessment",
+      "description": "Job positions and their linked technical assessment pools.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string" },
+        "roleLevel": { "type": "string" },
+        "experienceRequired": { "type": "string" },
+        "jdText": { "type": "string" },
+        "skillsExtracted": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "mandatorySkills": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "goodToHaveSkills": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "status": { "type": "string", "enum": ["Draft", "Published", "Closed"] },
+        "createdAt": { "type": "string" },
+        "questions": {
+          "type": "array",
+          "items": { "$ref": "#/entities/Question" }
+        },
+        "hrCount": { "type": "number" },
+        "techCount": { "type": "number" },
+        "codingCount": { "type": "number" },
+        "locations": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "required": ["id", "title", "roleLevel", "experienceRequired", "jdText", "status", "createdAt", "questions"]
+    },
+    "Candidate": {
+      "title": "Candidate",
+      "description": "Information about a candidate taking an assessment and their logs.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "email": { "type": "string" },
+        "phone": { "type": "string" },
+        "assessmentId": { "type": "string" },
+        "status": { "type": "string" },
+        "token": { "type": "string" },
+        "startedAt": { "type": "string" },
+        "completedAt": { "type": "string" },
+        "experience": { "type": "string" },
+        "skillsExtracted": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "location": { "type": "string" },
+        "aiAssessmentScore": { "type": "number" }
+      },
+      "required": ["id", "name", "email", "phone", "assessmentId", "status", "token"]
+    }
+  },
+  "firestore": {
+    "/accounts/{email}": {
+      "schema": "UserAccount",
+      "description": "Collection of recruiter and admin accounts, keyed by their lowercased email."
+    },
+    "/assessments/{assessmentId}": {
+      "schema": "Assessment",
+      "description": "Collection of recruiter-defined job assessments, with embedded questions."
+    },
+    "/candidates/{candidateId}": {
+      "schema": "Candidate",
+      "description": "Collection of prospective candidates undergoing assessment."
+    }
+  }
+}

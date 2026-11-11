@@ -1,0 +1,11 @@
+{
+  "name": "kreo Interview Portal (Revised)",
+  "description": "An enterprise-grade, zero-cost AI-driven L1 interview and proctored assessment platform with candidate tracking, JD question-bank extraction, and interactive code sandboxes.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
