@@ -18,10 +18,18 @@ import type { Assessment, Candidate } from '../../types';
 interface WelcomeScreenProps {
   candidate: Candidate;
   assessment: Assessment;
+  consentAccepted: boolean;
+  onConsentChange: (accepted: boolean) => void;
   onProceed: () => void;
 }
 
-export function WelcomeScreen({ candidate, assessment, onProceed }: WelcomeScreenProps) {
+export function WelcomeScreen({
+  candidate,
+  assessment,
+  consentAccepted,
+  onConsentChange,
+  onProceed
+}: WelcomeScreenProps) {
   return (
     <div className="w-full h-full overflow-y-auto py-8 md:py-12 flex flex-col items-center" id="step-welcome-wrapper">
       <div className="max-w-3xl w-full px-4 md:px-8" id="step-welcome">
@@ -100,10 +108,24 @@ export function WelcomeScreen({ candidate, assessment, onProceed }: WelcomeScree
             </ul>
           </div>
 
-          <div className="mt-8 flex gap-3">
+          <label className="mt-6 p-3.5 bg-slate-50 border border-slate-200 rounded-xl flex items-start gap-3 cursor-pointer text-left">
+            <input
+              type="checkbox"
+              checked={consentAccepted}
+              onChange={(e) => onConsentChange(e.target.checked)}
+              className="mt-0.5 h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer"
+              id="candidate-consent-checkbox"
+            />
+            <span className="text-xs text-slate-600 leading-relaxed">
+              I consent to webcam, microphone, screen recording, and automated proctoring telemetry during this interview for recruitment evaluation, and understand that automated scores are reviewed by hiring personnel.
+            </span>
+          </label>
+
+          <div className="mt-6 flex gap-3">
             <button
+              disabled={!consentAccepted}
               onClick={onProceed}
-              className="w-full py-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-sm font-semibold flex items-center justify-center gap-2 shadow-lg shadow-indigo-600/10 transition-colors"
+              className="w-full py-3 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-200 disabled:text-slate-400 disabled:cursor-not-allowed text-white rounded-xl text-sm font-semibold flex items-center justify-center gap-2 shadow-lg shadow-indigo-600/10 transition-colors cursor-pointer"
               id="btn-confirm-start"
             >
               Proceed to Security Checks <ArrowRight className="w-4 h-4" />

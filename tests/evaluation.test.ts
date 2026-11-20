@@ -371,3 +371,154 @@ test('7. Production mode refuses fake ZIP resume candidate generation instead of
     process.env.NODE_ENV = prevEnv;
   }
 });
+
+test('8. Already finalized interviews are locked (409) and cannot be re-opened or overwritten', async () => {
+  // tok-strong-candidate was finalized in test 4
+  const valRes = await fetch(`${baseUrl}/api/interview/tok-strong-candidate/validate`);
+  assert.equal(valRes.status, 409);
+
+  const startRes = await fetch(`${baseUrl}/api/interview/tok-strong-candidate/start`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ consentAcceptedAt: new Date().toISOString() })
+  });
+  assert.equal(startRes.status, 409);
+
+  const evalRes = await fetch(`${baseUrl}/api/interview/tok-strong-candidate/evaluate-answer`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      questionId: 'q-tech-1',
+      category: 'tech',
+      questionText: 'Explain event loop',
+      candidateAnswer: 'Trying to overwrite a completed answer'
+    })
+  });
+  assert.equal(evalRes.status, 409);
+
+  const completeRes = await fetch(`${baseUrl}/api/interview/tok-strong-candidate/complete`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      transcripts: [],
+      proctoringSummary: { tabSwitches: 0 },
+      isSuspended: false
+    })
+  });
+  assert.equal(completeRes.status, 409);
+});
+
+test('9. Expired invite tokens are rejected with 410 across interview endpoints', async () => {
+  const db = getDb();
+  db.candidates.push({
+    id: 'cand-expired',
+    name: 'Expired Link Candidate',
+    email: 'expired@example.com',
+    phone: '+91 9999900099',
+    assessmentId: 'asmt-eval-1',
+    status: 'Pending',
+    token: 'tok-expired-candidate',
+    tokenExpiresAt: new Date(Date.now() - 60_000).toISOString(),
+    orgName: 'Kreo Software',
+    createdAt: new Date(Date.now() - 86_400_000).toISOString()
+  });
+
+  const valRes = await fetch(`${baseUrl}/api/interview/tok-expired-candidate/validate`);
+  assert.equal(valRes.status, 410);
+
+  const startRes = await fetch(`${baseUrl}/api/interview/tok-expired-candidate/start`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ consentAcceptedAt: new Date().toISOString() })
+  });
+  assert.equal(startRes.status, 410);
+
+  const completeRes = await fetch(`${baseUrl}/api/interview/tok-expired-candidate/complete`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ transcripts: [], proctoringSummary: { tabSwitches: 0 }, isSuspended: false })
+  });
+  assert.equal(completeRes.status, 410);
+});
+
+test('10. Invalid invite tokens are rejected (404) on /clarify-question and /evaluate-answer', async () => {
+  const clarifyRes = await fetch(`${baseUrl}/api/interview/tok-does-not-exist/clarify-question`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ questionText: 'Test?', candidateQuery: 'Can you clarify?' })
+  });
+  assert.equal(clarifyRes.status, 404);
+
+  const evalRes = await fetch(`${baseUrl}/api/interview/tok-does-not-exist/evaluate-answer`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      questionId: 'q-tech-1',
+      category: 'tech',
+      questionText: 'Test?',
+      candidateAnswer: 'Some answer'
+    })
+  });
+  assert.equal(evalRes.status, 404);
+});
+
+test('11. New candidates receive high-entropy tokens, expiry timestamps, consent tracking, and real coding sandbox logs', async () => {
+  const createRes = await fetch(`${baseUrl}/api/candidates`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${adminToken}`
+    },
+    body: JSON.stringify({
+      name: 'Lifecycle Candidate',
+      email: 'lifecycle@example.com',
+      phone: '+91 9999900055',
+      assessmentId: 'asmt-eval-1'
+    })
+  });
+  assert.equal(createRes.status, 200);
+  const created = await createRes.json();
+  assert.ok(created.token.startsWith('tok-'));
+  assert.ok(created.token.length >= 36, 'Invite token should be cryptographically high entropy');
+  assert.ok(created.tokenExpiresAt, 'Invite token should include an expiry timestamp');
+  assert.ok(Date.parse(created.tokenExpiresAt) > Date.now(), 'Invite token expiry should be in the future');
+
+  const consentTime = new Date().toISOString();
+  const startRes = await fetch(`${baseUrl}/api/interview/${created.token}/start`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ consentAcceptedAt: consentTime })
+  });
+  assert.equal(startRes.status, 200);
+  const startedCand = getDb().candidates.find((c) => c.token === created.token);
+  assert.equal(startedCand?.consentAcceptedAt, consentTime);
+
+  const evalCodeRes = await fetch(`${baseUrl}/api/interview/${created.token}/evaluate-answer`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      questionId: 'q-code-1',
+      category: 'coding',
+      questionText: 'Implement dedupeById',
+      candidateAnswer: 'function dedupe(arr) { return [...new Map(arr.map(x => [x.id, x])).values()]; }',
+      codeLanguage: 'javascript',
+      codeExecutionOutput: '[Output]: [{"id":1},{"id":2}]'
+    })
+  });
+  assert.equal(evalCodeRes.status, 200);
+
+  const completeRes = await fetch(`${baseUrl}/api/interview/${created.token}/complete`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      transcripts: [],
+      proctoringSummary: { tabSwitches: 0 },
+      isSuspended: false
+    })
+  });
+  assert.equal(completeRes.status, 200);
+  const completed = await completeRes.json();
+  assert.equal(completed.feedbackReport.transcripts[0].codeLanguage, 'javascript');
+  assert.equal(completed.feedbackReport.transcripts[0].codeExecutionOutput, '[Output]: [{"id":1},{"id":2}]');
+});
+

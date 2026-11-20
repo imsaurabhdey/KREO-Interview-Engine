@@ -27,6 +27,34 @@ const codeExecutionLimiter = createRateLimiter({
   message: 'Code execution rate limit reached (max 15 runs per 5 minutes). Please wait before running again.'
 });
 
+function isDemoToken(token: string): boolean {
+  return token === 'demo' || token === 'demo-test-token';
+}
+
+function checkCandidateSessionAccess(
+  candidate: { status: string; tokenExpiresAt?: string },
+  options: { allowFinalized?: boolean } = {}
+): { statusCode: number; error: string } | null {
+  if (!options.allowFinalized && (candidate.status === 'Completed' || candidate.status === 'Suspended')) {
+    return {
+      statusCode: 409,
+      error: 'This interview session has already been finalized and can no longer be modified or retaken.'
+    };
+  }
+
+  if (candidate.tokenExpiresAt) {
+    const expiryMs = Date.parse(candidate.tokenExpiresAt);
+    if (Number.isFinite(expiryMs) && Date.now() > expiryMs) {
+      return {
+        statusCode: 410,
+        error: 'This interview invitation link has expired. Please contact your recruiter for a new invitation.'
+      };
+    }
+  }
+
+  return null;
+}
+
 // Validate Candidate Token & Fetch Customized Assessment (supports both /:token/validate and /validate/:token)
 interviewRouter.get(['/:token/validate', '/validate/:token'], (req, res) => {
   const token = req.params.token;
@@ -34,6 +62,11 @@ interviewRouter.get(['/:token/validate', '/validate/:token'], (req, res) => {
   const candidate = db.candidates.find((c) => c.token === token);
   if (!candidate) {
     return res.status(404).json({ error: 'Interview access token is invalid or expired.' });
+  }
+
+  const accessError = checkCandidateSessionAccess(candidate);
+  if (accessError) {
+    return res.status(accessError.statusCode).json({ error: accessError.error });
   }
 
   let assessment = db.assessments.find((a) => a.id === candidate.assessmentId);
@@ -77,21 +110,50 @@ interviewRouter.get(['/:token/validate', '/validate/:token'], (req, res) => {
 // Start Candidate Test
 interviewRouter.post('/:token/start', (req, res) => {
   const { token } = req.params;
+  const { consentAcceptedAt } = req.body || {};
   const db = getDb();
   const candIndex = db.candidates.findIndex((c) => c.token === token);
   if (candIndex === -1) {
     return res.status(404).json({ error: 'Candidate not found.' });
   }
 
-  db.candidates[candIndex].status = 'In Progress';
-  db.candidates[candIndex].startedAt = new Date().toISOString();
+  const candidate = db.candidates[candIndex];
+  const accessError = checkCandidateSessionAccess(candidate);
+  if (accessError) {
+    return res.status(accessError.statusCode).json({ error: accessError.error });
+  }
+
+  const assessment = db.assessments.find((a) => a.id === candidate.assessmentId);
+  if (assessment && assessment.status === 'Closed') {
+    return res.status(403).json({ error: 'This skill requisition has been closed.' });
+  }
+
+  candidate.status = 'In Progress';
+  candidate.startedAt = new Date().toISOString();
+  if (typeof consentAcceptedAt === 'string' && consentAcceptedAt.trim()) {
+    candidate.consentAcceptedAt = consentAcceptedAt.trim();
+  }
+  db.candidates[candIndex] = candidate;
   saveDb(db);
-  res.json(db.candidates[candIndex]);
+  res.json(candidate);
 });
 
 // AI Clarify Question / Provide conceptual hint
 interviewRouter.post('/:token/clarify-question', async (req, res) => {
-  const { questionText, category } = req.body;
+  const { token } = req.params;
+  const { questionText, category } = req.body || {};
+
+  if (!isDemoToken(token)) {
+    const db = getDb();
+    const candidate = db.candidates.find((c) => c.token === token);
+    if (!candidate) {
+      return res.status(404).json({ error: 'Interview access token is invalid or expired.' });
+    }
+    const accessError = checkCandidateSessionAccess(candidate);
+    if (accessError) {
+      return res.status(accessError.statusCode).json({ error: accessError.error });
+    }
+  }
 
   const ai = getGeminiClient();
   let clarificationText = "I am looking to understand your high-level conceptual approach or design options for this scenario. Could you share your thoughts on the general solution?";
@@ -144,7 +206,7 @@ Instructions for Clarification:
 // AI Evaluate Single Interview Answer & Draft speech reaction
 interviewRouter.post('/:token/evaluate-answer', async (req, res) => {
   const { token } = req.params;
-  const { questionId, candidateAnswer, questionText, category, isCrossAnswer } = req.body;
+  const { questionId, candidateAnswer, questionText, category, isCrossAnswer, codeLanguage, codeExecutionOutput } = req.body || {};
 
   let responseMessage = 'Got it. Thank you for your response. Let us proceed to the next query.';
   let outCrossQuestionText = '';
@@ -152,6 +214,15 @@ interviewRouter.post('/:token/evaluate-answer', async (req, res) => {
 
   const db = getDb();
   const candIndex = db.candidates.findIndex((c) => c.token === token);
+  if (!isDemoToken(token)) {
+    if (candIndex === -1) {
+      return res.status(404).json({ error: 'Interview access token is invalid or expired.' });
+    }
+    const accessError = checkCandidateSessionAccess(db.candidates[candIndex]);
+    if (accessError) {
+      return res.status(accessError.statusCode).json({ error: accessError.error });
+    }
+  }
   const candidateAnswerStr = candidateAnswer || '';
 
   const naturalFillers = [
@@ -252,7 +323,11 @@ interviewRouter.post('/:token/evaluate-answer', async (req, res) => {
         score: 0,
         crossQuestionText: outCrossQuestionText,
         crossAnswerText: '',
-        crossAiEvaluation: ''
+        crossAiEvaluation: '',
+        ...(typeof codeLanguage === 'string' && codeLanguage.trim() ? { codeLanguage: codeLanguage.trim() } : {}),
+        ...(typeof codeExecutionOutput === 'string' && codeExecutionOutput.trim()
+          ? { codeExecutionOutput: codeExecutionOutput.slice(0, 4000) }
+          : {})
       };
 
       if (existingIdx !== -1) {
@@ -317,6 +392,17 @@ interviewRouter.post('/:token/complete', async (req, res) => {
   const { token } = req.params;
   const { transcripts, proctoringSummary, isSuspended, clientCheatingLogs } = req.body || {};
 
+  const db = getDb();
+  const existingCand = db.candidates.find((c) => c.token === token);
+  if (!existingCand) {
+    return res.status(404).json({ error: 'Candidate not found.' });
+  }
+
+  const accessError = checkCandidateSessionAccess(existingCand);
+  if (accessError) {
+    return res.status(accessError.statusCode).json({ error: accessError.error });
+  }
+
   const result = finalizeInterviewEvaluation({
     candidateToken: token,
     clientTranscripts: Array.isArray(transcripts) ? transcripts : undefined,
@@ -328,6 +414,9 @@ interviewRouter.post('/:token/complete', async (req, res) => {
 
   if (!result) {
     return res.status(404).json({ error: 'Candidate not found.' });
+  }
+  if (result.alreadyFinalized) {
+    return res.status(409).json({ error: 'This interview session has already been finalized.' });
   }
 
   const { candidate, assessment } = result;
@@ -352,6 +441,15 @@ interviewRouter.post('/:token/upload-recording', upload.single('recording'), asy
   }
 
   const candidate = db.candidates[candIndex];
+  // Allow the initial recording upload right after completion, but block overwriting an existing recording once finalized
+  if (candidate.recordingUrl && (candidate.status === 'Completed' || candidate.status === 'Suspended')) {
+    return res.status(409).json({ error: 'A session recording has already been archived for this finalized interview.' });
+  }
+  const expiryError = checkCandidateSessionAccess(candidate, { allowFinalized: true });
+  if (expiryError) {
+    return res.status(expiryError.statusCode).json({ error: expiryError.error });
+  }
+
   if (!req.file) {
     return res.status(400).json({ error: 'No recording file uploaded.' });
   }
@@ -386,7 +484,7 @@ interviewRouter.post('/:token/execute-code', codeExecutionLimiter, async (req, r
   const { code, language = 'javascript' } = req.body;
 
   // 1. Verify active candidate interview token OR authenticated Recruiter/Admin demo session
-  if (token === 'demo' || token === 'demo-test-token') {
+  if (isDemoToken(token)) {
     const authUser = tryAuthenticateRequest(req);
     if (!authUser) {
       return res.status(401).json({ error: 'Demo code execution requires an authenticated Recruiter or Admin session.' });
@@ -400,6 +498,11 @@ interviewRouter.post('/:token/execute-code', codeExecutionLimiter, async (req, r
 
     if (candidate.status === 'Completed' || candidate.status === 'Suspended') {
       return res.status(403).json({ error: 'Code execution is disabled because this interview session is closed.' });
+    }
+
+    const expiryError = checkCandidateSessionAccess(candidate, { allowFinalized: true });
+    if (expiryError) {
+      return res.status(expiryError.statusCode).json({ error: expiryError.error });
     }
 
     const asmt = (db.assessments || []).find((a) => a.id === candidate.assessmentId);

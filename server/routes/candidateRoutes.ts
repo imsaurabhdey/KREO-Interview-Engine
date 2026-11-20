@@ -7,6 +7,7 @@
  * minimal list projections, and audit logging.
  */
 
+import crypto from 'crypto';
 import { Router } from 'express';
 import { Type } from '@google/genai';
 import { getDb, saveDb } from '../db';
@@ -168,15 +169,18 @@ candidateRouter.post('/', (req, res) => {
     return res.status(400).json({ error: 'No assessment found to assign this candidate to. Please create an assessment first.' });
   }
 
-  const token = `tok-${Math.random().toString(36).substring(2, 11)}`;
+  const tokenTtlDays = Math.max(1, Number(process.env.INVITE_TOKEN_TTL_DAYS || 7));
+  const tokenExpiresAt = new Date(Date.now() + tokenTtlDays * 24 * 60 * 60 * 1000).toISOString();
+  const token = `tok-${crypto.randomBytes(16).toString('hex')}`;
   const newCandidate: Candidate = {
-    id: `cand-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+    id: `cand-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
     name: cleanName,
     email: cleanEmail,
     phone: phone || 'N/A',
     assessmentId: asmtId,
     status: 'Pending',
     token,
+    tokenExpiresAt,
     experience: experience || 'Not specified',
     location: location || 'Remote',
     skillsExtracted: skillsExtracted || [],

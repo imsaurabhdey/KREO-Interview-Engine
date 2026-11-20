@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Sparkles,
   Mail,
@@ -16,6 +16,7 @@ import {
   Download
 } from 'lucide-react';
 import type { Assessment, Candidate } from '../../types';
+import { apiFetch } from '../../utils/authFetch';
 
 interface CandidateReportPanelProps {
   selectedCandidate: Candidate | null;
@@ -38,6 +39,47 @@ export default function CandidateReportPanel({
   onForceCompileReport,
   onNotifyUser
 }: CandidateReportPanelProps) {
+  const [resolvedRecordingSrc, setResolvedRecordingSrc] = useState<string>('');
+  const [recordingLoadError, setRecordingLoadError] = useState<string>('');
+
+  const rawRecordingUrl = selectedCandidate?.recordingUrl || demoRecordingUrl || '';
+
+  useEffect(() => {
+    let active = true;
+    let objectUrl: string | null = null;
+    setRecordingLoadError('');
+
+    if (!rawRecordingUrl) {
+      setResolvedRecordingSrc('');
+      return;
+    }
+
+    if (rawRecordingUrl.startsWith('/recordings/')) {
+      setResolvedRecordingSrc('');
+      apiFetch(rawRecordingUrl)
+        .then(async (res) => {
+          if (!res.ok) {
+            throw new Error(`Unable to load recording (HTTP ${res.status})`);
+          }
+          const blob = await res.blob();
+          objectUrl = URL.createObjectURL(blob);
+          if (active) setResolvedRecordingSrc(objectUrl);
+        })
+        .catch((err) => {
+          if (active) {
+            setRecordingLoadError(err?.message || 'Unable to load protected recording.');
+          }
+        });
+    } else {
+      setResolvedRecordingSrc(rawRecordingUrl);
+    }
+
+    return () => {
+      active = false;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [rawRecordingUrl]);
+
   if (!selectedCandidate) {
     return (
       <div className="bg-white border border-slate-200 rounded-2xl p-8 shadow-sm text-center text-slate-400 min-h-[350px] flex flex-col items-center justify-center">
@@ -403,7 +445,10 @@ export default function CandidateReportPanel({
             </h4>
             <p className="text-slate-700 text-xs leading-relaxed font-sans">
               {selectedCandidate.feedbackReport?.summary ||
-                `Based on full dialogue transcription and coding evaluation against the job description for ${appliedRoleTitle}, candidate ${selectedCandidate.name} demonstrated strong analytical reasoning and clear verbal articulation.`}
+                `No automated evaluation summary has been compiled yet for ${selectedCandidate.name} (${appliedRoleTitle}).`}
+            </p>
+            <p className="text-[10px] text-slate-500 pt-1 border-t border-indigo-100/80 font-sans">
+              Human Review Notice: Automated scores and summaries are screening aids only. Review the full transcript, code submission, and recording before making final hiring decisions.
             </p>
           </div>
 
@@ -412,41 +457,38 @@ export default function CandidateReportPanel({
               <h4 className="text-xs font-mono uppercase tracking-widest text-emerald-800 font-bold flex items-center gap-1.5">
                 <CheckCircle className="w-4 h-4 text-emerald-600 shrink-0" /> Key Strengths
               </h4>
-              <ul className="text-xs text-slate-700 space-y-2 list-disc list-inside font-sans">
-                {selectedCandidate.feedbackReport?.pros && selectedCandidate.feedbackReport.pros.length > 0 ? (
-                  selectedCandidate.feedbackReport.pros.map((p, idx) => (
+              {selectedCandidate.feedbackReport?.pros && selectedCandidate.feedbackReport.pros.length > 0 ? (
+                <ul className="text-xs text-slate-700 space-y-2 list-disc list-inside font-sans">
+                  {selectedCandidate.feedbackReport.pros.map((p, idx) => (
                     <li key={idx} className="leading-relaxed">
                       {p}
                     </li>
-                  ))
-                ) : (
-                  <>
-                    <li>Highly responsive logic with minimal communication pauses.</li>
-                    <li>Solid grasp of core software engineering fundamentals.</li>
-                    <li>Clear explanation of code structure and edge case handling.</li>
-                  </>
-                )}
-              </ul>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-xs text-slate-500 italic font-sans">
+                  No structured strength highlights were recorded for this session.
+                </p>
+              )}
             </div>
 
             <div className="border border-slate-200 bg-slate-50/50 p-4 rounded-xl space-y-2">
               <h4 className="text-xs font-mono uppercase tracking-widest text-slate-700 font-bold flex items-center gap-1.5">
                 <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" /> Areas of Improvement & Weaknesses
               </h4>
-              <ul className="text-xs text-slate-700 space-y-2 list-disc list-inside font-sans">
-                {selectedCandidate.feedbackReport?.cons && selectedCandidate.feedbackReport.cons.length > 0 ? (
-                  selectedCandidate.feedbackReport.cons.map((c, idx) => (
+              {selectedCandidate.feedbackReport?.cons && selectedCandidate.feedbackReport.cons.length > 0 ? (
+                <ul className="text-xs text-slate-700 space-y-2 list-disc list-inside font-sans">
+                  {selectedCandidate.feedbackReport.cons.map((c, idx) => (
                     <li key={idx} className="leading-relaxed">
                       {c}
                     </li>
-                  ))
-                ) : (
-                  <>
-                    <li>Could deepen discussion around distributed system constraints.</li>
-                    <li>Occasional speech fillers during complex algorithm drafting.</li>
-                  </>
-                )}
-              </ul>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-xs text-slate-500 italic font-sans">
+                  No structured improvement notes were recorded for this session.
+                </p>
+              )}
             </div>
           </div>
 
@@ -507,55 +549,71 @@ export default function CandidateReportPanel({
           )}
 
           {/* Candidate Dual Screen + Camera Recording Player */}
-          <div className="border border-slate-200 rounded-xl overflow-hidden bg-slate-950 text-white shadow-sm">
-            <div className="p-3 bg-slate-900 border-b border-slate-800 flex justify-between items-center text-xs font-mono">
-              <div className="flex items-center gap-2">
-                <Video className="w-4 h-4 text-emerald-400 shrink-0 animate-pulse" />
-                <span className="font-semibold text-emerald-300">
-                  CANDIDATE DUAL RECORDING (SCREEN SHARE + CAMERA PIP OVERLAY)
+          {selectedCandidate.recordingUrl || demoRecordingUrl ? (
+            <div className="border border-slate-200 rounded-xl overflow-hidden bg-slate-950 text-white shadow-sm">
+              <div className="p-3 bg-slate-900 border-b border-slate-800 flex justify-between items-center text-xs font-mono">
+                <div className="flex items-center gap-2">
+                  <Video className="w-4 h-4 text-emerald-400 shrink-0 animate-pulse" />
+                  <span className="font-semibold text-emerald-300">
+                    CANDIDATE DUAL RECORDING (SCREEN SHARE + CAMERA PIP OVERLAY)
+                  </span>
+                </div>
+                <span className="text-[10px] text-slate-400">
+                  {selectedCandidate.recordingDuration
+                    ? `${Math.floor(selectedCandidate.recordingDuration / 60)}m ${Math.round(selectedCandidate.recordingDuration % 60)}s`
+                    : 'Duration unavailable'}
                 </span>
               </div>
-              <span className="text-[10px] text-slate-400">
-                {selectedCandidate.recordingDuration
-                  ? `${Math.floor(selectedCandidate.recordingDuration / 60)}m ${Math.round(selectedCandidate.recordingDuration % 60)}s`
-                  : '12m 40s'}
-              </span>
-            </div>
 
-            <div className="relative bg-slate-900 flex items-center justify-center overflow-hidden aspect-video">
-              <video
-                src={
-                  selectedCandidate.recordingUrl ||
-                  demoRecordingUrl ||
-                  'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4'
-                }
-                controls
-                playsInline
-                className="w-full h-full object-contain"
-                preload="auto"
-              />
-            </div>
-
-            <div className="p-3 bg-slate-900 border-t border-slate-800 flex justify-between items-center gap-3">
-              <div className="text-[10px] text-slate-400 font-mono">
-                Single composite webm video file containing screen share + camera feed.
+              <div className="relative bg-slate-900 flex items-center justify-center overflow-hidden aspect-video">
+                {recordingLoadError ? (
+                  <div className="p-6 text-center text-xs text-rose-300">
+                    {recordingLoadError}
+                  </div>
+                ) : resolvedRecordingSrc ? (
+                  <video
+                    src={resolvedRecordingSrc}
+                    controls
+                    playsInline
+                    className="w-full h-full object-contain"
+                    preload="auto"
+                  />
+                ) : (
+                  <div className="p-6 text-center text-xs text-slate-400">
+                    Loading authenticated recording...
+                  </div>
+                )}
               </div>
-              <a
-                href={
-                  selectedCandidate.recordingUrl ||
-                  demoRecordingUrl ||
-                  'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4'
-                }
-                download={`${selectedCandidate.name.replace(/\s+/g, '_')}_Dual_Recording.webm`}
-                target="_blank"
-                rel="noreferrer"
-                className="flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded text-xs text-white transition-all cursor-pointer font-medium shadow-xs"
-              >
-                <Download className="w-3.5 h-3.5" />
-                Download Video File (.webm)
-              </a>
+
+              <div className="p-3 bg-slate-900 border-t border-slate-800 flex justify-between items-center gap-3">
+                <div className="text-[10px] text-slate-400 font-mono">
+                  Single composite webm video file containing screen share + camera feed.
+                </div>
+                {resolvedRecordingSrc && (
+                  <a
+                    href={resolvedRecordingSrc}
+                    download={`${selectedCandidate.name.replace(/\s+/g, '_')}_Dual_Recording.webm`}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded text-xs text-white transition-all cursor-pointer font-medium shadow-xs"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    Download Video File (.webm)
+                  </a>
+                )}
+              </div>
             </div>
-          </div>
+          ) : (
+            <div className="border border-slate-200 rounded-xl p-5 bg-slate-50 text-slate-500 flex items-center gap-3 text-xs">
+              <Video className="w-5 h-5 text-slate-400 shrink-0" />
+              <div>
+                <p className="font-semibold text-slate-700">No Session Recording Available</p>
+                <p className="text-[11px] text-slate-500 mt-0.5">
+                  No video/screen recording file was uploaded for this candidate session.
+                </p>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -574,6 +632,7 @@ export default function CandidateReportPanel({
                     <div>
                       <span className="text-[10px] font-mono font-bold text-indigo-600 uppercase tracking-wider">
                         CODING PROBLEM {idx + 1}
+                        {t.codeLanguage ? ` • ${t.codeLanguage.toUpperCase()}` : ''}
                       </span>
                       <h4 className="text-xs font-bold text-slate-800 mt-0.5">{t.questionText}</h4>
                     </div>
@@ -589,12 +648,15 @@ export default function CandidateReportPanel({
                     {t.candidateAnswer}
                   </div>
 
-                  <div className="p-3 bg-slate-900 border-t border-slate-800 font-mono text-[10px] text-emerald-400 space-y-0.5">
-                    <div className="text-slate-500 uppercase select-none">Piston Compiler Sandbox Execution Output:</div>
-                    <div>[Compiler Execution Engine v2.1 OK]</div>
-                    <div>- Syntax check: Passed</div>
-                    <div>- Test cases executed: 3/3 Passed</div>
-                    <div>- Status: Code executed with 0 runtime errors.</div>
+                  <div className="p-3 bg-slate-900 border-t border-slate-800 font-mono text-[10px] text-slate-300 space-y-1 whitespace-pre-wrap">
+                    <div className="text-slate-500 uppercase select-none">Recorded Sandbox Execution Output:</div>
+                    {t.codeExecutionOutput ? (
+                      <div className="text-emerald-300">{t.codeExecutionOutput}</div>
+                    ) : (
+                      <div className="text-slate-400 italic">
+                        No automated sandbox test execution output was recorded for this submission.
+                      </div>
+                    )}
                   </div>
 
                   <div className="p-4 bg-indigo-50/30 border-t border-slate-200">

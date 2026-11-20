@@ -5,6 +5,7 @@
  * Enterprise User Authentication & Corporate Account Management Routes.
  */
 
+import crypto from 'crypto';
 import { Router } from 'express';
 import { getDb, saveDb, hashPassword, verifyPassword } from '../db';
 import { UserAccount, UserRole } from '../types';
@@ -32,10 +33,20 @@ const authAttemptLimiter = createRateLimiter({
 interface PasswordResetEntry {
   code: string;
   expiresAt: number;
+  attempts: number;
 }
+
+const MAX_RESET_ATTEMPTS = 5;
 
 // In-memory verification code store for password resets
 const passwordResetStore = new Map<string, PasswordResetEntry>();
+
+function constantTimeCodeMatch(expected: string, provided: string): boolean {
+  const a = Buffer.from(expected, 'utf-8');
+  const b = Buffer.from(provided, 'utf-8');
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
 
 function isPrimaryProtectedAdmin(email: string): boolean {
   const bootstrapEmail = (process.env.BOOTSTRAP_ADMIN_EMAIL || '').trim().toLowerCase();
@@ -101,20 +112,26 @@ authRouter.post('/forgot-password', authAttemptLimiter, async (req, res) => {
     return res.status(404).json({ error: 'No corporate account found matching this email address.' });
   }
 
-  // Generate 6-digit verification code
-  const resetCode = Math.floor(100000 + Math.random() * 900000).toString();
+  // Generate cryptographically secure 6-digit verification code
+  const resetCode = crypto.randomInt(100000, 1000000).toString();
   const expiresAt = Date.now() + 15 * 60 * 1000; // 15 minutes
 
-  passwordResetStore.set(userEmail, { code: resetCode, expiresAt });
+  passwordResetStore.set(userEmail, { code: resetCode, expiresAt, attempts: 0 });
 
   try {
     const emailResult = await sendPasswordResetEmail(matchedUser.email, matchedUser.name, resetCode);
+    if (emailResult.mode !== 'sent' && process.env.NODE_ENV === 'production') {
+      passwordResetStore.delete(userEmail);
+      return res.status(503).json({
+        error: 'Email delivery is not configured in production. Contact an administrator to reset your password.'
+      });
+    }
     res.json({
       success: true,
       mode: emailResult.mode,
       message: emailResult.mode === 'sent'
         ? `A 6-digit password reset verification code has been dispatched to ${userEmail}.`
-        : `Verification code generated: ${resetCode} (sandbox mode active). Check your console or enter code.`
+        : `Verification code generated: ${resetCode} (development sandbox mode).`
     });
   } catch (err: any) {
     res.status(500).json({ error: 'Failed to dispatch verification email. Please try again.' });
@@ -140,8 +157,19 @@ authRouter.post('/reset-password', authAttemptLimiter, (req, res) => {
     return res.status(400).json({ error: 'Verification code has expired. Please request a new one.' });
   }
 
-  if (resetRecord.code !== String(code).trim()) {
-    return res.status(400).json({ error: 'Invalid verification code. Please check your email and try again.' });
+  const providedCode = String(code).trim();
+  if (!constantTimeCodeMatch(resetRecord.code, providedCode)) {
+    resetRecord.attempts += 1;
+    if (resetRecord.attempts >= MAX_RESET_ATTEMPTS) {
+      passwordResetStore.delete(userEmail);
+      return res.status(429).json({
+        error: 'Too many incorrect verification attempts. Code invalidated — please request a new verification code.'
+      });
+    }
+    const remaining = MAX_RESET_ATTEMPTS - resetRecord.attempts;
+    return res.status(400).json({
+      error: `Invalid verification code. ${remaining} attempt${remaining === 1 ? '' : 's'} remaining.`
+    });
   }
 
   const db = getDb();

@@ -12,7 +12,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
-import { hashPassword, resetDbCacheForTests } from '../server/db';
+import { hashPassword, resetDbCacheForTests, getDb } from '../server/db';
+import { recordingsDir } from '../server/s3Storage';
 import { createApp } from '../server';
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kreo-security-test-'));
@@ -420,3 +421,91 @@ test('8. Operations safety rails: security headers, restricted CORS, and 2 MB de
   });
   assert.equal(largeRes.status, 413);
 });
+
+test('9. Interview recordings require authentication and enforce organization ownership', async () => {
+  const testRecordingName = `test-sec-recording-${Date.now()}.webm`;
+  const testRecordingPath = path.join(recordingsDir, testRecordingName);
+  fs.writeFileSync(testRecordingPath, Buffer.from('mock-webm-video-bytes'));
+
+  try {
+    const db = getDb();
+    const cand = db.candidates.find((c) => c.id === 'cand-active-1');
+    assert.ok(cand);
+    cand.recordingUrl = `/recordings/${testRecordingName}`;
+
+    // Unauthenticated viewer rejected (401)
+    const unauthRes = await fetch(`${baseUrl}/recordings/${testRecordingName}`);
+    assert.equal(unauthRes.status, 401);
+
+    // Authenticated user from a different organization rejected (403)
+    const otherOrgRes = await fetch(`${baseUrl}/recordings/${testRecordingName}`, {
+      headers: { Authorization: `Bearer ${otherOrgToken}` }
+    });
+    assert.equal(otherOrgRes.status, 403);
+
+    // Authorized recruiter from the same organization allowed (200) with no-store header
+    const sameOrgRes = await fetch(`${baseUrl}/recordings/${testRecordingName}`, {
+      headers: { Authorization: `Bearer ${recruiterToken}` }
+    });
+    assert.equal(sameOrgRes.status, 200);
+    assert.equal(sameOrgRes.headers.get('cache-control'), 'private, no-store');
+    const body = await sameOrgRes.text();
+    assert.equal(body, 'mock-webm-video-bytes');
+  } finally {
+    if (fs.existsSync(testRecordingPath)) {
+      fs.unlinkSync(testRecordingPath);
+    }
+  }
+});
+
+test('10. Password reset codes are invalidated after 5 failed verification attempts', async () => {
+  const forgotRes = await fetch(`${baseUrl}/api/auth/forgot-password`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: 'recruiter@irissoftware.com' })
+  });
+  assert.equal(forgotRes.status, 200);
+  const forgotData = await forgotRes.json();
+  const match = String(forgotData.message || '').match(/\b(\d{6})\b/);
+  assert.ok(match, 'Development sandbox mode should return the 6-digit reset code for test verification');
+  const realCode = match[1];
+  const wrongCode = realCode === '000000' ? '111111' : '000000';
+
+  for (let i = 1; i <= 4; i++) {
+    const badRes = await fetch(`${baseUrl}/api/auth/reset-password`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: 'recruiter@irissoftware.com',
+        code: wrongCode,
+        newPassword: 'AttemptedNewPassword!1'
+      })
+    });
+    assert.equal(badRes.status, 400);
+  }
+
+  // 5th wrong attempt invalidates the reset code with 429
+  const fifthRes = await fetch(`${baseUrl}/api/auth/reset-password`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      email: 'recruiter@irissoftware.com',
+      code: wrongCode,
+      newPassword: 'AttemptedNewPassword!1'
+    })
+  });
+  assert.equal(fifthRes.status, 429);
+
+  // Even the real code is now rejected because it was invalidated
+  const afterLockoutRes = await fetch(`${baseUrl}/api/auth/reset-password`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      email: 'recruiter@irissoftware.com',
+      code: realCode,
+      newPassword: 'AttemptedNewPassword!1'
+    })
+  });
+  assert.equal(afterLockoutRes.status, 400);
+});
+

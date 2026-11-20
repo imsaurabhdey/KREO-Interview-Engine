@@ -7,6 +7,7 @@ import React, { useState, useEffect } from 'react';
 import LoginScreen from './components/LoginScreen';
 import RecruiterPortal from './components/RecruiterPortal';
 import CandidateExperience from './components/CandidateExperience';
+import ErrorBoundary from './components/ErrorBoundary';
 import SafeStorage from './utils/safeStorage';
 import { apiFetch, clearAuthToken, getAuthToken, onUnauthorized } from './utils/authFetch';
 
@@ -101,12 +102,14 @@ export default function App() {
   // 1. If Candidate token is present in the parameters, direct instantly to Proctoring interface
   if (tokenParam) {
     return (
-      <div className="min-h-screen bg-slate-50 font-sans text-slate-800" id="kreo-candidate-portal">
-        <CandidateExperience
-          token={tokenParam}
-          onFinished={handleCandidateFinished}
-        />
-      </div>
+      <ErrorBoundary>
+        <div className="min-h-screen bg-slate-50 font-sans text-slate-800" id="kreo-candidate-portal">
+          <CandidateExperience
+            token={tokenParam}
+            onFinished={handleCandidateFinished}
+          />
+        </div>
+      </ErrorBoundary>
     );
   }
 
@@ -124,18 +127,20 @@ export default function App() {
 
   // 3. Otherwise direct to the Admin/Recruiter dashboard or Login module
   return (
-    <div className="min-h-screen bg-slate-50 font-sans text-slate-800" id="kreo-recruiter-portal">
-      {userRole ? (
-        <RecruiterPortal
-          userRole={userRole}
-          userEmail={userEmail}
-          onLogout={handleLogout}
-        />
-      ) : (
-        <LoginScreen
-          onSuccess={handleLoginSuccess}
-        />
-      )}
-    </div>
+    <ErrorBoundary>
+      <div className="min-h-screen bg-slate-50 font-sans text-slate-800" id="kreo-recruiter-portal">
+        {userRole ? (
+          <RecruiterPortal
+            userRole={userRole}
+            userEmail={userEmail}
+            onLogout={handleLogout}
+          />
+        ) : (
+          <LoginScreen
+            onSuccess={handleLoginSuccess}
+          />
+        )}
+      </div>
+    </ErrorBoundary>
   );
 }

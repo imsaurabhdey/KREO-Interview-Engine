@@ -48,6 +48,7 @@ export interface FinalizeInterviewResult {
   candidate: Candidate;
   assessment?: Assessment;
   queuedAiEvaluation: boolean;
+  alreadyFinalized?: boolean;
 }
 
 const VALID_AI_DECISIONS: ReadonlySet<string> = new Set(['Strong Hire', 'Hire', 'Neutral', 'Reject']);
@@ -327,6 +328,12 @@ export function mergeAuthoritativeTranscripts(
       if (!existing.crossQuestionText?.trim() && c.crossQuestionText?.trim()) {
         existing.crossQuestionText = c.crossQuestionText;
       }
+      if (!existing.codeExecutionOutput?.trim() && c.codeExecutionOutput?.trim()) {
+        existing.codeExecutionOutput = c.codeExecutionOutput;
+      }
+      if (!existing.codeLanguage?.trim() && c.codeLanguage?.trim()) {
+        existing.codeLanguage = c.codeLanguage;
+      }
     }
   }
 
@@ -356,6 +363,16 @@ export function finalizeInterviewEvaluation(input: FinalizeInterviewInput): Fina
 
   const candidate = db.candidates[candIndex];
   const assessment = db.assessments.find((a) => a.id === candidate.assessmentId);
+
+  // Lock finalized interviews so completed or suspended reports cannot be overwritten by re-submission
+  if (candidate.status === 'Completed' || candidate.status === 'Suspended') {
+    return {
+      candidate,
+      assessment,
+      queuedAiEvaluation: false,
+      alreadyFinalized: true
+    };
+  }
 
   const compliance = assessProctoringCompliance(proctoringSummary, isSuspended, clientCheatingLogs);
   const activeTranscripts = mergeAuthoritativeTranscripts(candidate.feedbackReport?.transcripts, clientTranscripts);

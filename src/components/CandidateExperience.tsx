@@ -35,6 +35,8 @@ export default function CandidateExperience({ token, isDemo, onFinished }: Candi
 
   // Setup / Permissions states
   const [step, setStep] = useState<'welcome' | 'permissions' | 'proctor-check' | 'interview' | 'finished'>('welcome');
+  const [consentAccepted, setConsentAccepted] = useState(false);
+  const [consentAcceptedAt, setConsentAcceptedAt] = useState<string | null>(null);
   const [hasCam, setHasCam] = useState<boolean | null>(null);
   const [hasMic, setHasMic] = useState<boolean | null>(null);
   const [hasScreenShare, setHasScreenShare] = useState<boolean | null>(null);
@@ -1072,7 +1074,13 @@ export default function CandidateExperience({ token, isDemo, onFinished }: Candi
     
     // Start active candidate test status on backend
     if (!isDemoSession) {
-      fetch(`/api/interview/${token}/start`, { method: 'POST' });
+      fetch(`/api/interview/${token}/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          consentAcceptedAt: consentAcceptedAt || new Date().toISOString()
+        })
+      }).catch((err) => console.warn('[Interview] Failed to mark session start:', err));
     }
   };
 
@@ -1140,27 +1148,19 @@ export default function CandidateExperience({ token, isDemo, onFinished }: Candi
     document.addEventListener('cut', handleClipboardEvent);
     document.addEventListener('paste', handleClipboardEvent);
 
-    // 5. Mimic actual AI visual eye tracking updates in background (enhanced cellphone, shifting and vacancy triggers)
+    // 5. Real camera-track health check (no random/simulated proctoring accusations)
     const visualProctoredInterval = setInterval(() => {
-      const randomSeed = Math.random();
-      if (randomSeed > 0.93) {
-        // Look away Gaze deviation simulation
-        setGazeDeviationScore(prev => Math.min(100, Math.floor(randomSeed * 45 + 55)));
-        handleMlStateChange('shifted');
-      } else if (randomSeed > 0.88 && randomSeed <= 0.93) {
-        // Cell Phone proximity detection simulation
-        handleMlStateChange('phone');
-      } else if (randomSeed > 0.82 && randomSeed <= 0.88) {
-        // Vacant camera frame simulation
-        handleMlStateChange('empty');
-      } else {
-        setGazeDeviationScore(prev => Math.max(0, Math.floor(Math.random() * 8)));
-        // Return back to normal dynamically if previously triggered simulated state
-        if (simulatedMlState !== 'normal' && simulatedMlState !== 'camera_off') {
-          handleMlStateChange('normal');
+      const stream = (videoRef.current?.srcObject as MediaStream | null) || webStream;
+      const videoTrack = stream?.getVideoTracks?.()[0];
+      if (!videoTrack || videoTrack.readyState !== 'live' || !videoTrack.enabled) {
+        if (simulatedMlState !== 'camera_off') {
+          handleMlStateChange('camera_off');
         }
+      } else if (simulatedMlState === 'camera_off') {
+        handleMlStateChange('normal');
       }
-    }, 15000);
+      setGazeDeviationScore(0);
+    }, 5000);
 
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
@@ -1329,7 +1329,7 @@ export default function CandidateExperience({ token, isDemo, onFinished }: Candi
     const proctoringSummaryObj: ProctoringSummary = {
       tabSwitches: tabSwitches + (finalReason.includes('Tab') ? 1 : 0),
       browserFocusViolations: browserBlurCount + (finalReason.includes('blurred') ? 1 : 0),
-      faceDetectionsLost: Math.floor(Math.random() * 5) + 3,
+      faceDetectionsLost: notVisibleViolations,
       copyPasteAttempts,
       cameraOffViolations,
       notVisibleViolations,
@@ -1428,6 +1428,10 @@ export default function CandidateExperience({ token, isDemo, onFinished }: Candi
     try {
       // 1. If we are NOT currently in a cross-question follow-up, evaluate primary and check if we trigger a follow-up
       if (!isCrossQuestionActive) {
+        const isCodingQuestion = activeQuestion.category === 'coding';
+        const recordedCodeOutput = isCodingQuestion ? codeConsole.trim() : undefined;
+        const recordedCodeLang = isCodingQuestion ? selectedLanguage : undefined;
+
         const res = await fetch(`/api/interview/${token}/evaluate-answer`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1436,7 +1440,9 @@ export default function CandidateExperience({ token, isDemo, onFinished }: Candi
             questionText: activeQuestion.question,
             candidateAnswer: answerText,
             category: activeQuestion.category,
-            isCrossAnswer: false
+            isCrossAnswer: false,
+            codeLanguage: recordedCodeLang,
+            codeExecutionOutput: recordedCodeOutput
           })
         });
 
@@ -1453,6 +1459,8 @@ export default function CandidateExperience({ token, isDemo, onFinished }: Candi
             candidateAnswer: answerText,
             aiEvaluation: evaluation.aiEvaluation,
             score: evaluation.score,
+            codeLanguage: recordedCodeLang,
+            codeExecutionOutput: recordedCodeOutput,
             crossQuestionText: evaluation.crossQuestionText,
             crossAnswerText: '',
             crossAiEvaluation: ''
@@ -1477,6 +1485,8 @@ export default function CandidateExperience({ token, isDemo, onFinished }: Candi
             candidateAnswer: answerText,
             aiEvaluation: evaluation.aiEvaluation,
             score: evaluation.score,
+            codeLanguage: recordedCodeLang,
+            codeExecutionOutput: recordedCodeOutput,
             crossQuestionText: '',
             crossAnswerText: '',
             crossAiEvaluation: ''
@@ -1640,7 +1650,7 @@ export default function CandidateExperience({ token, isDemo, onFinished }: Candi
       const summary: ProctoringSummary = {
         tabSwitches,
         browserFocusViolations: browserBlurCount,
-        faceDetectionsLost: Math.floor(Math.random() * 3) + (gazeDeviationScore > 20 ? 4 : 0),
+        faceDetectionsLost: notVisibleViolations,
         copyPasteAttempts,
         cameraOffViolations,
         notVisibleViolations,
@@ -2310,6 +2320,11 @@ export default function CandidateExperience({ token, isDemo, onFinished }: Candi
         <WelcomeScreen
           candidate={candidate}
           assessment={assessment}
+          consentAccepted={consentAccepted}
+          onConsentChange={(accepted) => {
+            setConsentAccepted(accepted);
+            setConsentAcceptedAt(accepted ? new Date().toISOString() : null);
+          }}
           onProceed={() => setStep('permissions')}
         />
       )}

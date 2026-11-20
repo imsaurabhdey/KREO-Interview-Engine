@@ -7,6 +7,7 @@
  */
 
 import express from 'express';
+import fs from 'fs';
 import path from 'path';
 
 // Import modular domain routes
@@ -18,6 +19,8 @@ import { utilityRouter } from './server/routes/utilityRoutes';
 import { questionBankRouter } from './server/routes/questionBankRoutes';
 
 // Import storage & security middleware
+import { getDb } from './server/db';
+import { requireAuth, canAccessOrg, logAuditEvent } from './server/authMiddleware';
 import { recordingsDir, runRecordingsCleanup } from './server/s3Storage';
 import { isGroqConfigured } from './server/groq';
 import {
@@ -74,6 +77,43 @@ export function createApp() {
   app.use('/api/interview', interviewRouter);
   app.use('/api/question-bank', questionBankRouter);
   app.use('/api', utilityRouter);
+
+  // Authenticated, organization-scoped interview recording delivery (never exposed publicly)
+  app.get('/recordings/:fileName', requireAuth, (req, res) => {
+    const rawName = String(req.params.fileName || '');
+    const safeName = path.basename(rawName);
+    if (!safeName || safeName !== rawName || safeName.includes('..') || safeName.includes('/') || safeName.includes('\\')) {
+      return res.status(400).json({ error: 'Invalid recording file name.' });
+    }
+
+    const db = getDb();
+    const expectedUrl = `/recordings/${safeName}`;
+    const candidate = db.candidates.find((c) => c.recordingUrl === expectedUrl);
+    if (!candidate) {
+      return res.status(404).json({ error: 'Recording not found.' });
+    }
+
+    const linkedAssessment = db.assessments.find((a) => a.id === candidate.assessmentId);
+    const ownerOrg = candidate.orgName || linkedAssessment?.orgName;
+    if (!canAccessOrg(req.authUser!, ownerOrg)) {
+      logAuditEvent('ACCESS_DENIED', req.authUser!, {
+        path: req.originalUrl,
+        method: 'GET',
+        reason: 'cross_org_recording_access',
+        candidateId: candidate.id
+      });
+      return res.status(403).json({ error: 'Forbidden: you do not have access to this organization recording.' });
+    }
+
+    const resolvedDir = path.resolve(recordingsDir);
+    const resolvedFile = path.resolve(resolvedDir, safeName);
+    if (!resolvedFile.startsWith(resolvedDir + path.sep) || !fs.existsSync(resolvedFile)) {
+      return res.status(404).json({ error: 'Recording file is unavailable or expired.' });
+    }
+
+    res.setHeader('Cache-Control', 'private, no-store');
+    return res.sendFile(resolvedFile);
+  });
 
   // Return 404 JSON for unknown/removed API endpoints instead of SPA HTML
   app.use('/api', (_req, res) => {
@@ -141,10 +181,7 @@ const startServer = async () => {
     console.error('[CLEANUP] Initial boot recordings cleanup error:', err);
   }
 
-  // 3. Serve interview audio/video recordings directory statically
-  app.use('/recordings', express.static(recordingsDir));
-
-  // 4. Vite Middleware in Development, Static Serving in Production
+  // 3. Vite Middleware in Development, Static Serving in Production (recordings are served via authenticated /recordings/:fileName above)
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({

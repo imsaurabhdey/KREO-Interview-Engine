@@ -111,6 +111,8 @@ export interface TranscriptEntry {
   crossQuestionText?: string;
   crossAnswerText?: string;
   crossAiEvaluation?: string;
+  codeLanguage?: string;
+  codeExecutionOutput?: string;
 }
 
 export interface EvaluationHistoryEntry {
@@ -160,4 +162,6 @@ export interface Candidate {
   recordingUrl?: string;
   recordingDuration?: number;
   selectionStatus?: 'Selected' | 'Not Selected' | 'Processing';
+  tokenExpiresAt?: string;
+  consentAcceptedAt?: string;
 }
