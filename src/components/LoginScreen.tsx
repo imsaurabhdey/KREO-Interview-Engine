@@ -193,7 +193,7 @@ export default function LoginScreen({ onSuccess }: LoginScreenProps) {
             <span><strong className="font-bold">KREO</strong> AI Engine</span>
           </h1>
           <p className="text-xs text-slate-500 mt-1">
-            Enterprise Automated Proctoring & Talent Assessment Platform
+            Proctoring & Talent Assessment Platform
           </p>
         </div>
 
@@ -216,7 +216,7 @@ export default function LoginScreen({ onSuccess }: LoginScreenProps) {
           <div id="login-form-block">
             <form onSubmit={handleLoginSubmit} className="space-y-4">
               <div>
-                <label className="block text-[10px] font-mono text-slate-500 uppercase tracking-wider mb-1">Corporate Email Address</label>
+                <label className="block text-[10px] font-mono text-slate-500 uppercase tracking-wider mb-1">Email Address</label>
                 <div className="relative">
                   <span className="absolute left-3 top-3 text-slate-400">
                     <Mail className="w-4 h-4" />
@@ -235,7 +235,7 @@ export default function LoginScreen({ onSuccess }: LoginScreenProps) {
 
               <div>
                 <div className="flex justify-between items-center mb-1">
-                  <label className="block text-[10px] font-mono text-slate-500 uppercase tracking-wider">Confidential Password</label>
+                  <label className="block text-[10px] font-mono text-slate-500 uppercase tracking-wider">Password</label>
                   <button
                     type="button"
                     onClick={() => {
@@ -445,7 +445,7 @@ export default function LoginScreen({ onSuccess }: LoginScreenProps) {
 
         {/* Footer info text */}
         <p className="text-[10px] text-slate-400 text-center mt-6 font-sans">
-          Secured by kreo Software AI Cryptographic Identity Tokens.
+          Secured by KREO Software AI Cryptographic Identity Tokens.
         </p>
       </motion.div>
     </div>
