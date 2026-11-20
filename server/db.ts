@@ -15,7 +15,13 @@ import { mergeDuplicateQuestionsInBank } from './questionGenerator';
 import { DbStore, UserAccount, Assessment, Candidate } from './types';
 import bcrypt from 'bcryptjs';
 
-export const DB_PATH = path.join(process.cwd(), 'db.json');
+export function getDbPath(): string {
+  return process.env.DB_PATH_OVERRIDE
+    ? path.resolve(process.env.DB_PATH_OVERRIDE)
+    : path.join(process.cwd(), 'db.json');
+}
+
+export const DB_PATH = getDbPath();
 
 /**
  * Validates whether a candidate record is a synthetic test artifact.
@@ -79,12 +85,57 @@ if (fs.existsSync(configPath)) {
 }
 
 /**
+ * Bootstraps an initial Admin account ONLY when the database has zero accounts.
+ * Never embeds hardcoded passwords in source code; uses BOOTSTRAP_ADMIN_* env vars
+ * or generates a one-time random password logged once on initial setup.
+ */
+function ensureBootstrapAdminIfEmpty(accounts: UserAccount[]): boolean {
+  if (accounts.length > 0) return false;
+
+  const envEmail = (process.env.BOOTSTRAP_ADMIN_EMAIL || '').trim().toLowerCase();
+  const envPassword = (process.env.BOOTSTRAP_ADMIN_PASSWORD || '').trim();
+  const envName = (process.env.BOOTSTRAP_ADMIN_NAME || 'Primary Admin').trim();
+  const envOrg = (process.env.BOOTSTRAP_ORG_NAME || 'Kreo Software').trim();
+
+  const email = envEmail || 'admin@kreo.local';
+  const generatedPassword = envPassword || crypto.randomBytes(12).toString('base64url');
+
+  accounts.push({
+    id: `usr-bootstrap-${Date.now()}`,
+    name: envName,
+    email,
+    passwordHash: hashPassword(generatedPassword),
+    role: 'Admin',
+    orgName: envOrg,
+    createdAt: new Date().toISOString()
+  });
+
+  if (envEmail && envPassword) {
+    console.log(`[AUTH BOOTSTRAP] Initialized primary Admin account from environment variables (${email}).`);
+  } else {
+    console.log(
+      `[AUTH BOOTSTRAP] Database had no accounts. Created initial Admin (${email}) with one-time password: ${generatedPassword} — please log in and change this password immediately.`
+    );
+  }
+  return true;
+}
+
+export function resetDbCacheForTests() {
+  if (nextWriteTimeout) {
+    clearTimeout(nextWriteTimeout);
+    nextWriteTimeout = null;
+  }
+  inMemoryDb = null;
+}
+
+/**
  * Loads database state from local JSON cache or initial seed accounts/assessments.
  */
 export function loadDb(): DbStore {
+  const dbFilePath = getDbPath();
   try {
-    if (fs.existsSync(DB_PATH)) {
-      const data = fs.readFileSync(DB_PATH, 'utf-8');
+    if (fs.existsSync(dbFilePath)) {
+      const data = fs.readFileSync(dbFilePath, 'utf-8');
       const parsed = JSON.parse(data);
       
       if (!parsed.accounts) {
@@ -94,43 +145,12 @@ export function loadDb(): DbStore {
         parsed.questionBank = [];
       }
       
-      const hasSaurabh = parsed.accounts.some((acc: any) => acc.email.toLowerCase() === 'saurabh.dey@irisoftware.com');
-      if (!hasSaurabh) {
-        parsed.accounts.push({
-          id: 'usr-saurabh',
-          name: 'Saurabh Dey',
-          email: 'saurabh.dey@irisoftware.com',
-          passwordHash: hashPassword('saurabh$123%'),
-          role: 'Admin',
-          orgName: 'Kreo Software',
-          createdAt: new Date().toISOString()
-        });
-      }
-
-      const hasRecruiter = parsed.accounts.some((acc: any) => acc.email.toLowerCase() === 'recruiter@irisoftware.com');
-      if (!hasRecruiter) {
-        parsed.accounts.push({
-          id: 'usr-recruiter',
-          name: 'Alisha Cooper',
-          email: 'recruiter@irisoftware.com',
-          passwordHash: hashPassword('recruiter123'),
-          role: 'Recruiter',
-          orgName: 'Kreo Software Labs',
-          createdAt: new Date().toISOString()
-        });
-      }
-
-      const hasBackupAdmin = parsed.accounts.some((acc: any) => acc.email.toLowerCase() === 'admin@irisoftware.com');
-      if (!hasBackupAdmin) {
-        parsed.accounts.push({
-          id: 'usr-admin',
-          name: 'System Admin',
-          email: 'admin@irisoftware.com',
-          passwordHash: hashPassword('admin123'),
-          role: 'Admin',
-          orgName: 'Kreo Software Enterprise',
-          createdAt: new Date().toISOString()
-        });
+      if (ensureBootstrapAdminIfEmpty(parsed.accounts)) {
+        try {
+          fs.writeFileSync(dbFilePath, JSON.stringify(parsed, null, 2), 'utf-8');
+        } catch (e) {
+          console.warn('[DB] Failed to persist bootstrap admin account:', e);
+        }
       }
 
       if (parsed.candidates && Array.isArray(parsed.candidates)) {
@@ -151,20 +171,26 @@ export function loadDb(): DbStore {
 
         if (updatedAny) {
           try {
-            fs.writeFileSync(DB_PATH, JSON.stringify(parsed, null, 2), 'utf-8');
-          } catch (e) {}
+            fs.writeFileSync(dbFilePath, JSON.stringify(parsed, null, 2), 'utf-8');
+          } catch (e) {
+            console.warn('[DB] Failed to persist candidate normalization update:', e);
+          }
         }
       }
 
-      // Auto-seed all default questions if needed
-      const initialBankCount = (parsed.questionBank || []).length;
-      seedQuestionBankFromZip(parsed);
-      ensureQuestionBankPopulated(parsed);
-      mergeDuplicateQuestionsInBank(parsed);
-      if ((parsed.questionBank || []).length !== initialBankCount) {
-        try {
-          fs.writeFileSync(DB_PATH, JSON.stringify(parsed, null, 2), 'utf-8');
-        } catch (e) {}
+      // Auto-seed all default questions if needed (skip heavy ZIP scan during unit tests)
+      if (process.env.NODE_ENV !== 'test') {
+        const initialBankCount = (parsed.questionBank || []).length;
+        seedQuestionBankFromZip(parsed);
+        ensureQuestionBankPopulated(parsed);
+        mergeDuplicateQuestionsInBank(parsed);
+        if ((parsed.questionBank || []).length !== initialBankCount) {
+          try {
+            fs.writeFileSync(dbFilePath, JSON.stringify(parsed, null, 2), 'utf-8');
+          } catch (e) {
+            console.warn('[DB] Failed to persist auto-seeded question bank:', e);
+          }
+        }
       }
 
       inMemoryDb = parsed;
@@ -259,37 +285,13 @@ export function loadDb(): DbStore {
     }
   ];
 
-  const seedAccounts: UserAccount[] = [
-    {
-      id: 'usr-saurabh',
-      name: 'Saurabh Dey',
-      email: 'saurabh.dey@irisoftware.com',
-      passwordHash: hashPassword('saurabh$123%'),
-      role: 'Admin',
-      orgName: 'Kreo Software',
-      createdAt: new Date().toISOString()
-    },
-    {
-      id: 'usr-recruiter',
-      name: 'Alisha Cooper',
-      email: 'recruiter@irisoftware.com',
-      passwordHash: hashPassword('recruiter123'),
-      role: 'Recruiter',
-      orgName: 'Kreo Software Labs',
-      createdAt: new Date().toISOString()
-    },
-    {
-      id: 'usr-admin',
-      name: 'System Admin',
-      email: 'admin@irisoftware.com',
-      passwordHash: hashPassword('admin123'),
-      role: 'Admin',
-      orgName: 'Kreo Software Enterprise',
-      createdAt: new Date().toISOString()
-    }
-  ];
+  const seedAccounts: UserAccount[] = [];
+  ensureBootstrapAdminIfEmpty(seedAccounts);
 
   const initialDb: any = { assessments: seedAssessments, candidates: [], accounts: seedAccounts, questionBank: [] };
+  seedQuestionBankFromZip(initialDb);
+  ensureQuestionBankPopulated(initialDb);
+  mergeDuplicateQuestionsInBank(initialDb);
   inMemoryDb = initialDb;
   saveDb(initialDb, true);
   return initialDb;
@@ -330,6 +332,8 @@ function sanitizeForFirestore(obj: any): any {
 export function saveDb(data: DbStore, forceSync = false) {
   inMemoryDb = data;
 
+  const dbFilePath = getDbPath();
+
   // 1. Local JSON write with atomic renaming and debounce
   if (forceSync) {
     if (nextWriteTimeout) {
@@ -337,9 +341,9 @@ export function saveDb(data: DbStore, forceSync = false) {
       nextWriteTimeout = null;
     }
     try {
-      const tempPath = `${DB_PATH}.tmpync`;
+      const tempPath = `${dbFilePath}.tmpync`;
       fs.writeFileSync(tempPath, JSON.stringify(data, null, 2), 'utf-8');
-      fs.renameSync(tempPath, DB_PATH);
+      fs.renameSync(tempPath, dbFilePath);
     } catch (err) {
       console.error('Error saving db.json synchronously:', err);
     }
@@ -352,10 +356,10 @@ export function saveDb(data: DbStore, forceSync = false) {
       nextWriteTimeout = null;
       writeQueue = writeQueue.then(async () => {
         try {
-          const tempPath = `${DB_PATH}.tmp`;
+          const tempPath = `${dbFilePath}.tmp`;
           const dataStr = JSON.stringify(data, null, 2);
           await fs.promises.writeFile(tempPath, dataStr, 'utf-8');
-          await fs.promises.rename(tempPath, DB_PATH);
+          await fs.promises.rename(tempPath, dbFilePath);
         } catch (err) {
           console.error('Error saving db.json asynchronously:', err);
         }
@@ -498,7 +502,12 @@ export async function syncWithFirebase(localDb: DbStore): Promise<DbStore> {
       }
     }
 
-    const mergedDb: any = { accounts, assessments, candidates };
+    const mergedDb: any = {
+      accounts,
+      assessments,
+      candidates,
+      questionBank: localDb.questionBank || []
+    };
     inMemoryDb = mergedDb;
     return mergedDb;
   } catch (err: any) {

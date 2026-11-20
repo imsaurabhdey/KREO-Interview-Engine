@@ -6,6 +6,7 @@
 import React, { useState } from 'react';
 import { Shield, Lock, CheckCircle2, AlertCircle, Mail, Eye, EyeOff, KeyRound, ArrowLeft, RefreshCw } from 'lucide-react';
 import { motion } from 'motion/react';
+import { setAuthToken } from '../utils/authFetch';
 
 interface LoginScreenProps {
   onSuccess: (role: 'Admin' | 'Recruiter', email: string) => void;
@@ -16,8 +17,8 @@ export default function LoginScreen({ onSuccess }: LoginScreenProps) {
   const [mode, setMode] = useState<'login' | 'forgot'>('login');
   
   // Login States
-  const [email, setEmail] = useState('saurabh.dey@irisoftware.com');
-  const [password, setPassword] = useState('saurabh$123%');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   
   // Forgot Password States
@@ -40,6 +41,7 @@ export default function LoginScreen({ onSuccess }: LoginScreenProps) {
     try {
       const response = await fetch('/api/auth/login', {
         method: 'POST',
+        credentials: 'same-origin',
         headers: {
           'Content-Type': 'application/json',
         },
@@ -50,6 +52,9 @@ export default function LoginScreen({ onSuccess }: LoginScreenProps) {
       setIsLoading(false);
 
       if (response.ok && data.success) {
+        if (data.token) {
+          setAuthToken(data.token);
+        }
         onSuccess(data.user.role, data.user.email);
       } else {
         setError(data.error || 'Verification failed. Invalid email, password, or security credentials.');

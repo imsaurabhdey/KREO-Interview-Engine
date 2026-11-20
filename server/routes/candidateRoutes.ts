@@ -1,38 +1,78 @@
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
- * 
+ *
  * Enterprise Candidate Ingestion, Resume AI Extraction & Applicant Management Routes.
+ * Protected by server-verified recruiter/admin authentication, organization scoping,
+ * minimal list projections, and audit logging.
  */
 
 import { Router } from 'express';
 import { Type } from '@google/genai';
 import { getDb, saveDb } from '../db';
 import { Candidate } from '../types';
-import { getGeminiClient, generateContentWithFallback } from '../gemini';
+import { getGeminiClient, generateContentWithFallback, cleanAndParseJSON } from '../gemini';
 import { deleteCandidateRecording } from '../s3Storage';
 import { sendCandidateEmail } from '../emailService';
+import { requireAuth, canAccessOrg, logAuditEvent } from '../authMiddleware';
+import { DEV_ZIP_SAMPLE_CANDIDATES } from '../demoFixtures';
 
 export const candidateRouter = Router();
 
-// Collection route: GET all candidates
-candidateRouter.get('/', (_req, res) => {
+// Require verified Recruiter/Admin session on all candidate management endpoints
+candidateRouter.use(requireAuth);
+
+/**
+ * Projects a candidate record for collection list views, omitting heavy raw interview
+ * transcripts while preserving all summary metrics required by the dashboard.
+ */
+function projectCandidateSummary(candidate: Candidate) {
+  const { feedbackReport, ...rest } = candidate;
+  if (!feedbackReport) {
+    return rest;
+  }
+
+  const { transcripts, ...reportSummary } = feedbackReport;
+  return {
+    ...rest,
+    feedbackReport: {
+      ...reportSummary,
+      transcripts: [],
+      transcriptCount: Array.isArray(transcripts) ? transcripts.length : 0
+    }
+  };
+}
+
+// Collection route: GET candidates scoped to caller's organization (summary projection)
+candidateRouter.get('/', (req, res) => {
   const db = getDb();
-  res.json(db.candidates || []);
+  const scoped = (db.candidates || [])
+    .filter((c) => canAccessOrg(req.authUser!, c.orgName))
+    .map(projectCandidateSummary);
+
+  res.json(scoped);
 });
 
-// Item route: GET candidate by ID or Token
+// Item route: GET full candidate detail (including transcripts) by ID or Token with audit log
 candidateRouter.get('/:idOrToken', (req, res) => {
   const { idOrToken } = req.params;
   const db = getDb();
-  const candidate = db.candidates.find(c => c.id === idOrToken || c.token === idOrToken);
+  const candidate = (db.candidates || []).find(
+    (c) => (c.id === idOrToken || c.token === idOrToken) && canAccessOrg(req.authUser!, c.orgName)
+  );
   if (!candidate) {
     return res.status(404).json({ error: 'Candidate not found.' });
   }
+
+  logAuditEvent('CANDIDATE_DETAIL_READ', req.authUser!, {
+    candidateId: candidate.id,
+    assessmentId: candidate.assessmentId
+  });
+
   res.json(candidate);
 });
 
-// Explicit Check Duplicate Candidate API
+// Explicit Check Duplicate Candidate API (scoped to organization)
 candidateRouter.post('/check-duplicate', (req, res) => {
   const { email, phone, excludeId } = req.body;
   const cleanEmail = (email || '').trim().toLowerCase();
@@ -44,7 +84,7 @@ candidateRouter.post('/check-duplicate', (req, res) => {
   let duplicateByPhone = false;
   let matchedCandidate: Candidate | undefined = undefined;
 
-  for (const c of db.candidates || []) {
+  for (const c of (db.candidates || []).filter((cand) => canAccessOrg(req.authUser!, cand.orgName))) {
     if (excludeId && c.id === excludeId) continue;
 
     if (cleanEmail && c.email && c.email.trim().toLowerCase() === cleanEmail) {
@@ -65,12 +105,12 @@ candidateRouter.post('/check-duplicate', (req, res) => {
     const fieldDesc = (duplicateByEmail && duplicateByPhone)
       ? 'email and phone number'
       : (duplicateByEmail ? 'email address' : 'phone number');
-    
+
     return res.json({
       duplicate: true,
       error: `Candidate already exists with this ${fieldDesc}${matchedCandidate ? ` (${matchedCandidate.name})` : ''} in the system.`,
       duplicateField: duplicateByEmail && duplicateByPhone ? 'both' : (duplicateByEmail ? 'email' : 'phone'),
-      existingCandidate: matchedCandidate
+      existingCandidate: matchedCandidate ? { id: matchedCandidate.id, name: matchedCandidate.name } : undefined
     });
   }
 
@@ -83,21 +123,22 @@ candidateRouter.post('/', (req, res) => {
   const cleanName = (name || '').trim();
   const cleanEmail = (email || '').trim().toLowerCase();
   const cleanPhone = (phone || '').trim().replace(/\D/g, '');
-  
+
   if (!cleanName || !cleanEmail) {
     return res.status(400).json({ error: 'Name and email are required.' });
   }
 
   const db = getDb();
+  const orgCandidates = (db.candidates || []).filter((c) => canAccessOrg(req.authUser!, c.orgName));
 
-  // Enforce duplicate candidate check against existing email and phone number
-  const existingCandidateByEmail = (db.candidates || []).find(
-    c => c.email && c.email.trim().toLowerCase() === cleanEmail
+  // Enforce duplicate candidate check against existing email and phone number within org
+  const existingCandidateByEmail = orgCandidates.find(
+    (c) => c.email && c.email.trim().toLowerCase() === cleanEmail
   );
-  
+
   const existingCandidateByPhone = cleanPhone && cleanPhone.length >= 7
-    ? (db.candidates || []).find(
-        c => c.phone && c.phone !== 'N/A' && c.phone.trim().replace(/\D/g, '') === cleanPhone
+    ? orgCandidates.find(
+        (c) => c.phone && c.phone !== 'N/A' && c.phone.trim().replace(/\D/g, '') === cleanPhone
       )
     : undefined;
 
@@ -105,34 +146,26 @@ candidateRouter.post('/', (req, res) => {
     const matchReason = (existingCandidateByEmail && existingCandidateByPhone)
       ? 'email address and phone number'
       : (existingCandidateByEmail ? 'email address' : 'phone number');
-    const matchedName = (existingCandidateByEmail || existingCandidateByPhone)?.name;
+    const matched = existingCandidateByEmail || existingCandidateByPhone;
 
     return res.status(409).json({
-      error: `Candidate already exists with this ${matchReason}${matchedName ? ` (${matchedName})` : ''} in the system.`,
+      error: `Candidate already exists with this ${matchReason}${matched?.name ? ` (${matched.name})` : ''} in the system.`,
       duplicate: true,
       duplicateField: existingCandidateByEmail ? 'email' : 'phone',
-      existingCandidate: existingCandidateByEmail || existingCandidateByPhone
+      existingCandidate: matched ? { id: matched.id, name: matched.name } : undefined
     });
   }
 
+  const orgAssessments = (db.assessments || []).filter((a) => canAccessOrg(req.authUser!, a.orgName));
   let asmtId = assessmentId;
-  if (!asmtId && db.assessments && db.assessments.length > 0) {
-    asmtId = db.assessments[0].id;
+  if (asmtId && !orgAssessments.some((a) => a.id === asmtId)) {
+    return res.status(404).json({ error: 'Selected assessment not found in your organization.' });
+  }
+  if (!asmtId && orgAssessments.length > 0) {
+    asmtId = orgAssessments[0].id;
   }
   if (!asmtId) {
     return res.status(400).json({ error: 'No assessment found to assign this candidate to. Please create an assessment first.' });
-  }
-
-  let resolvedName = req.body.createdByName;
-  if (req.body.createdByEmail) {
-    const accountMatch = (db.accounts || []).find((a: any) => a.email && a.email.toLowerCase().trim() === req.body.createdByEmail.toLowerCase().trim());
-    if (accountMatch && accountMatch.name) {
-      resolvedName = accountMatch.name;
-    }
-  }
-  if (!resolvedName && req.body.createdByEmail) {
-    const parts = req.body.createdByEmail.split('@')[0].split(/[._-]/);
-    resolvedName = parts.map((p: string) => p.charAt(0).toUpperCase() + p.slice(1)).join(' ');
   }
 
   const token = `tok-${Math.random().toString(36).substring(2, 11)}`;
@@ -148,21 +181,28 @@ candidateRouter.post('/', (req, res) => {
     location: location || 'Remote',
     skillsExtracted: skillsExtracted || [],
     createdAt: new Date().toISOString(),
-    createdByEmail: req.body.createdByEmail || undefined,
-    createdByName: resolvedName || 'Saurabh Dey'
+    createdByEmail: req.authUser!.email,
+    createdByName: req.authUser!.name,
+    orgName: req.authUser!.orgName
   };
 
   db.candidates.push(newCandidate);
   saveDb(db, true);
+
+  logAuditEvent('CANDIDATE_CREATE', req.authUser!, {
+    candidateId: newCandidate.id,
+    assessmentId: newCandidate.assessmentId
+  });
+
   res.json(newCandidate);
 });
 
 // Update candidate status or selection decision
 candidateRouter.put('/:id', (req, res) => {
   const { id } = req.params;
-  const { status, selectionStatus } = req.body;
+  const { status, selectionStatus, feedbackReport, aiAssessmentScore } = req.body;
   const db = getDb();
-  const candidate = db.candidates.find(c => c.id === id);
+  const candidate = db.candidates.find((c) => c.id === id && canAccessOrg(req.authUser!, c.orgName));
   if (!candidate) {
     return res.status(404).json({ error: 'Candidate not found.' });
   }
@@ -170,12 +210,12 @@ candidateRouter.put('/:id', (req, res) => {
   if (status !== undefined) {
     candidate.status = status;
     if (status === 'Candidate Invited') {
-      const asmt = db.assessments.find(a => a.id === candidate.assessmentId);
+      const asmt = db.assessments.find((a) => a.id === candidate.assessmentId);
       const startLink = `${process.env.APP_URL || 'http://localhost:3000'}/?token=${candidate.token}`;
       sendCandidateEmail(candidate.email, candidate.name, 'INVITATION', {
         assessmentTitle: asmt?.title,
         startLink
-      }).catch(err => console.error("Async candidate email invite error:", err));
+      }).catch((err) => console.error('Async candidate email invite error:', err));
     }
   }
 
@@ -183,7 +223,28 @@ candidateRouter.put('/:id', (req, res) => {
     candidate.selectionStatus = selectionStatus;
   }
 
+  if (feedbackReport !== undefined && typeof feedbackReport === 'object') {
+    candidate.feedbackReport = {
+      ...(candidate.feedbackReport || {}),
+      ...feedbackReport,
+      transcripts: Array.isArray(feedbackReport.transcripts) && feedbackReport.transcripts.length > 0
+        ? feedbackReport.transcripts
+        : (candidate.feedbackReport?.transcripts || [])
+    };
+  }
+
+  if (aiAssessmentScore !== undefined) {
+    candidate.aiAssessmentScore = aiAssessmentScore;
+  }
+
   saveDb(db, true);
+
+  logAuditEvent('CANDIDATE_UPDATE', req.authUser!, {
+    candidateId: candidate.id,
+    status: candidate.status,
+    selectionStatus: candidate.selectionStatus
+  });
+
   res.json({ success: true, candidate });
 });
 
@@ -191,14 +252,17 @@ candidateRouter.put('/:id', (req, res) => {
 candidateRouter.delete('/:id', async (req, res) => {
   const { id } = req.params;
   const db = getDb();
-  const candidate = db.candidates.find(c => c.id === id);
-
-  if (candidate) {
-    await deleteCandidateRecording(candidate.token, candidate.name);
+  const candidate = db.candidates.find((c) => c.id === id && canAccessOrg(req.authUser!, c.orgName));
+  if (!candidate) {
+    return res.status(404).json({ error: 'Candidate not found.' });
   }
 
-  db.candidates = db.candidates.filter(c => c.id !== id);
+  await deleteCandidateRecording(candidate.token, candidate.name);
+
+  db.candidates = db.candidates.filter((c) => c.id !== id);
   saveDb(db, true);
+
+  logAuditEvent('CANDIDATE_DELETE', req.authUser!, { candidateId: id });
   res.json({ success: true });
 });
 
@@ -206,9 +270,9 @@ candidateRouter.delete('/:id', async (req, res) => {
 candidateRouter.post('/extract-file', async (req, res) => {
   const { fileName, fileType, fileData, files, assessmentId } = req.body;
   const db = getDb();
-  
-  const filesList = files && Array.isArray(files) 
-    ? files 
+
+  const filesList = files && Array.isArray(files)
+    ? files
     : (fileName && fileData ? [{ name: fileName, data: fileData, type: fileType }] : []);
 
   if (filesList.length === 0) {
@@ -217,7 +281,7 @@ candidateRouter.post('/extract-file', async (req, res) => {
 
   let assessmentDetails = '';
   if (assessmentId) {
-    const asmt = db.assessments.find(a => a.id === assessmentId);
+    const asmt = db.assessments.find((a) => a.id === assessmentId && canAccessOrg(req.authUser!, a.orgName));
     if (asmt) {
       assessmentDetails = `
       Compare the candidate precisely against these target job requirements:
@@ -261,7 +325,6 @@ candidateRouter.post('/extract-file', async (req, res) => {
       location: 'Bengaluru, India'
     };
 
-    // Analyze raw file base64 data to extract details
     try {
       if (f.data) {
         const rawText = Buffer.from(f.data, 'base64').toString('utf-8').replace(/[^\x20-\x7E\s]/g, ' ');
@@ -279,8 +342,8 @@ candidateRouter.post('/extract-file', async (req, res) => {
         }
 
         const knownSkills = [
-          'React', 'Node.js', 'TypeScript', 'Tailwind CSS', 'JavaScript', 'HTML5', 'CSS3', 'Vue.js', 'Angular', 
-          'Next.js', 'Express.js', 'Python', 'Django', 'Flask', 'FastAPI', 'Java', 'Docker', 'Kubernetes', 'AWS', 
+          'React', 'Node.js', 'TypeScript', 'Tailwind CSS', 'JavaScript', 'HTML5', 'CSS3', 'Vue.js', 'Angular',
+          'Next.js', 'Express.js', 'Python', 'Django', 'Flask', 'FastAPI', 'Java', 'Docker', 'Kubernetes', 'AWS',
           'SQL', 'PostgreSQL', 'MongoDB', 'C++', 'Go', 'Rust', 'PHP', 'Laravel', 'D3.js', 'Redux', 'System Design'
         ];
         const detectedSkills: string[] = [];
@@ -311,27 +374,6 @@ candidateRouter.post('/extract-file', async (req, res) => {
       }
     } catch (parseErr) {
       console.warn('[OFFLINE EXTRACT] Failed parsing base64 stream as text:', parseErr);
-    }
-
-    // Specific demo presets
-    if (fn_lower.includes('saurabh') && fn_lower.includes('dey')) {
-      fallbackCandidate.name = 'Saurabh Dey';
-      fallbackCandidate.email = 'imsaurabhdey@gmail.com';
-      fallbackCandidate.skills = ['React 19', 'Fullstack development', 'Node.js', 'D3.js', 'TypeScript', 'Gemini AI Integration'];
-      fallbackCandidate.experience = '5+ Years';
-      fallbackCandidate.location = 'Kolkata, India';
-    } else if (fn_lower.includes('jane') && fn_lower.includes('smith')) {
-      fallbackCandidate.name = 'Jane Smith';
-      fallbackCandidate.email = 'jane.smith@candidate.domain';
-      fallbackCandidate.skills = ['Python', 'Django', 'PostgreSQL', 'NLP', 'System Design'];
-      fallbackCandidate.experience = '4 Years';
-      fallbackCandidate.location = 'Mumbai, India';
-    } else if (fn_lower.includes('alex') && fn_lower.includes('carter')) {
-      fallbackCandidate.name = 'Alex Carter';
-      fallbackCandidate.email = 'alex.carter@careerportal.com';
-      fallbackCandidate.skills = ['Vue.js', 'Express.js', 'MongoDB', 'REST APIs', 'AWS'];
-      fallbackCandidate.experience = '3 Years';
-      fallbackCandidate.location = 'Pune, India';
     }
 
     // CSV format parsing
@@ -367,32 +409,17 @@ candidateRouter.post('/extract-file', async (req, res) => {
       }
     }
 
-    // ZIP Bulk format simulation
+    // ZIP archives: never silently fabricate candidates in production
     if (fn_lower.endsWith('.zip') || f.type?.includes('zip') || fileType === 'zip') {
-      results.push({
-        name: 'Arjun Mehta',
-        email: 'arjun.mehta@dev-applications.net',
-        phone: '+91 9123456789',
-        experience: '5 Years',
-        skills: ['React', 'Node.js', 'Next.js', 'Tailwind CSS', 'Redux'],
-        location: 'Bengaluru, India'
-      });
-      results.push({
-        name: 'Priya Sharma',
-        email: 'priya.sharma@talentpool.org',
-        phone: '+91 9876543210',
-        experience: '3 Years',
-        skills: ['TypeScript', 'Vue.js', 'Express', 'PostgreSQL', 'Docker'],
-        location: 'Noida, India'
-      });
-      results.push({
-        name: 'Vikram Singh',
-        email: 'v.singh@careerhub.com',
-        phone: '+91 8765432109',
-        experience: '7 Years',
-        skills: ['Python', 'FastAPI', 'AWS', 'Kubernetes', 'NLP', 'CI/CD'],
-        location: 'Mumbai, India'
-      });
+      if (process.env.NODE_ENV === 'production') {
+        return res.status(400).json({
+          error: 'Bulk ZIP resume extraction is not enabled in production. Please upload individual PDF/DOCX resumes or a CSV candidate roster.'
+        });
+      }
+      console.warn('[DEV FIXTURE] Using development-only sample candidates for ZIP upload simulation.');
+      for (const sample of DEV_ZIP_SAMPLE_CANDIDATES) {
+        results.push({ ...sample });
+      }
       continue;
     }
 
@@ -401,7 +428,7 @@ candidateRouter.post('/extract-file', async (req, res) => {
     if (ai) {
       try {
         const mimeToUse = f.type || (f.name.endsWith('.pdf') ? 'application/pdf' : 'text/plain');
-        console.log(`[GEMINI] Processing applicant resume using dynamic model routing helper`);
+        console.log('[GEMINI] Processing applicant resume using dynamic model routing helper');
         const response = await generateContentWithFallback(ai, {
           contents: {
             parts: [
@@ -412,8 +439,8 @@ candidateRouter.post('/extract-file', async (req, res) => {
                 }
               },
               {
-                text: `Analyze the attached candidate resume document. 
-                Extract and list the key profile points in structured format. 
+                text: `Analyze the attached candidate resume document.
+                Extract and list the key profile points in structured format.
                 ${assessmentDetails ? assessmentDetails : 'Compare the profile with general industry expectations.'}
 
                 Return a JSON object containing profile attributes: name, email, phone, experience, skills, location.`
@@ -438,7 +465,7 @@ candidateRouter.post('/extract-file', async (req, res) => {
         });
 
         if (response.text) {
-          const parsed = JSON.parse(response.text.trim());
+          const parsed = cleanAndParseJSON(response.text);
           results.push({
             name: parsed.name || fallbackCandidate.name,
             email: parsed.email || fallbackCandidate.email,

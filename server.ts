@@ -1,7 +1,7 @@
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
- * 
+ *
  * kreo AI Enterprise Core Server Entrypoint.
  * Modular, production-ready Express server with Vite middleware integration.
  */
@@ -17,51 +17,104 @@ import { interviewRouter } from './server/routes/interviewRoutes';
 import { utilityRouter } from './server/routes/utilityRoutes';
 import { questionBankRouter } from './server/routes/questionBankRoutes';
 
-// Import storage & services
+// Import storage & security middleware
 import { recordingsDir, runRecordingsCleanup } from './server/s3Storage';
 import { isGroqConfigured } from './server/groq';
+import {
+  securityHeadersMiddleware,
+  createCorsMiddleware,
+  createRateLimiter,
+  redactSensitiveData
+} from './server/securityMiddleware';
 
-const app = express();
 const PORT = 3000;
 
-// Enable CORS and High-Capacity JSON parser for handling resume base64 data & transcripts
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(200);
-  }
-  next();
-});
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
+export function createApp() {
+  const app = express();
+  app.disable('x-powered-by');
+  app.set('trust proxy', 1);
 
-// Health Check API
-app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    engine: 'kreo AI',
-    timestamp: new Date().toISOString(),
-    aiProviders: {
-      gemini: Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY'),
-      groqFallback: isGroqConfigured()
-    }
+  // 1. Security Headers & Restricted CORS Policy
+  app.use(securityHeadersMiddleware);
+  app.use(createCorsMiddleware());
+
+  // 2. Scoped JSON Body Size Limits (25 MB only on resume/bank file-upload routes; 2 MB default everywhere else)
+  const largePayloadParser = express.json({ limit: '25mb' });
+  app.use('/api/candidates/extract-file', largePayloadParser);
+  app.use('/api/question-bank/upload', largePayloadParser);
+  app.use(express.json({ limit: '2mb' }));
+  app.use(express.urlencoded({ limit: '2mb', extended: true }));
+
+  // 3. General API Burst Rate Limiter
+  const apiRateLimiter = createRateLimiter({
+    windowMs: 60 * 1000,
+    max: process.env.NODE_ENV === 'test' ? 1000 : 300,
+    keyPrefix: 'api',
+    message: 'API rate limit exceeded. Please slow down and try again.'
   });
-});
+  app.use('/api', apiRateLimiter);
 
-// Mount Enterprise API Domain Routers
-app.use('/api/auth', authRouter);
-app.use('/api/candidates', candidateRouter);
-app.use('/api/assessments', assessmentRouter);
-app.use('/api/interview', interviewRouter);
-app.use('/api/question-bank', questionBankRouter);
-app.use('/api', utilityRouter);
+  // Health Check API
+  app.get('/api/health', (_req, res) => {
+    res.json({
+      status: 'ok',
+      engine: 'kreo AI',
+      timestamp: new Date().toISOString(),
+      aiProviders: {
+        gemini: Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY'),
+        groqFallback: isGroqConfigured()
+      }
+    });
+  });
+
+  // Mount Enterprise API Domain Routers
+  app.use('/api/auth', authRouter);
+  app.use('/api/candidates', candidateRouter);
+  app.use('/api/assessments', assessmentRouter);
+  app.use('/api/interview', interviewRouter);
+  app.use('/api/question-bank', questionBankRouter);
+  app.use('/api', utilityRouter);
+
+  // Return 404 JSON for unknown/removed API endpoints instead of SPA HTML
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'API endpoint not found.' });
+  });
+
+  // Global Express JSON Error Handler with sensitive-field redaction
+  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const status = typeof err?.status === 'number' ? err.status : 500;
+    const logPayload = redactSensitiveData({
+      method: req.method,
+      path: req.originalUrl,
+      status,
+      error: err?.message || 'Internal server error'
+    });
+    console.error('[SERVER ERROR]', JSON.stringify(logPayload));
+
+    if (res.headersSent) {
+      return next(err);
+    }
+    if (err?.type === 'entity.too.large') {
+      return res.status(413).json({ error: 'Request payload is too large for this endpoint.' });
+    }
+    res.status(status).json({
+      error: status >= 500 ? 'Internal server error' : (err?.message || 'Request error')
+    });
+  });
+
+  return app;
+}
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[UNHANDLED REJECTION]', reason);
+});
 
 /**
  * Server Lifecycle & Asset Pipeline Orchestrator
  */
 const startServer = async () => {
+  const app = createApp();
+
   // 1. Audit Gemini & Groq AI Model Engine Status
   const apiKeyStatus = process.env.GEMINI_API_KEY;
   if (!apiKeyStatus) {
@@ -102,7 +155,7 @@ const startServer = async () => {
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
+    app.get('*', (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
@@ -113,4 +166,6 @@ const startServer = async () => {
   });
 };
 
-startServer();
+if (process.env.NODE_ENV !== 'test') {
+  startServer();
+}

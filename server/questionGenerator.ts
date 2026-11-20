@@ -322,16 +322,20 @@ export async function selectQuestionsFromQuestionBank(
   const allSkills = [...cleanMandatory, ...cleanGood];
   const combinedSkillsLower = allSkills.map(s => s.toLowerCase()).join(' ');
 
-  // Fetch true vector embeddings for requested skills via gemini-embedding-001 with fallback tolerance
+  // Fetch true vector embeddings for requested skills in parallel with timeout/fallback tolerance
   const skillEmbeddings = new Map<string, number[]>();
-  for (const sk of allSkills) {
-    try {
-      const emb = await getEmbedding(sk);
-      if (emb) {
-        skillEmbeddings.set(sk, emb);
+  await Promise.all(
+    allSkills.map(async (sk) => {
+      try {
+        const emb = await getEmbedding(sk);
+        if (emb) {
+          skillEmbeddings.set(sk, emb);
+        }
+      } catch (e) {
+        console.warn(`[QuestionGenerator] Embedding lookup skipped for skill "${sk}", using lexical fallback:`, e instanceof Error ? e.message : e);
       }
-    } catch (e) {}
-  }
+    })
+  );
 
   // Comprehensive enterprise-grade semantic skill clusters and synonym expansions
   const synonymsMap: Record<string, string[]> = {

@@ -34,16 +34,62 @@ export function getGeminiClient(): GoogleGenAI | null {
  */
 export const modelCooldowns = new Map<string, number>();
 const GLOBAL_COOLDOWN_MS = 20 * 1000; // 20 seconds cooldown on rate limits
+const UNAVAILABLE_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes cooldown on 404 / unsupported model
+const GEMINI_CALL_TIMEOUT_MS = 25 * 1000; // 25 seconds hard timeout per attempt
 
 /**
- * Gets an optimal sequence of text models to try, prioritizing those not on active cooldown.
+ * Strips parameters unsupported by Gemini 4 series models to prevent 400 Bad Request errors.
+ */
+function sanitizeConfigForModel(model: string, config?: any): any {
+  if (!config) return config;
+  const cleaned = { ...config };
+  if (model.startsWith('gemini-4-')) {
+    delete cleaned.temperature;
+    delete cleaned.topP;
+    delete cleaned.topK;
+    delete cleaned.candidateCount;
+    if (cleaned.thinkingConfig && typeof cleaned.thinkingConfig === 'object') {
+      const tc = { ...cleaned.thinkingConfig };
+      delete tc.thinkingBudget;
+      if (tc.thinkingLevel === 'MINIMAL') {
+        tc.thinkingLevel = 'LOW';
+      }
+      cleaned.thinkingConfig = tc;
+    }
+  }
+  return cleaned;
+}
+
+/**
+ * Checks if contents contains binary inlineData parts (e.g., PDF/image) unsuitable for text-only Groq fallback.
+ */
+function hasBinaryInlineData(contents: any): boolean {
+  if (!contents) return false;
+  if (Array.isArray(contents)) {
+    return contents.some(item => hasBinaryInlineData(item));
+  }
+  if (typeof contents === 'object') {
+    if (contents.inlineData) return true;
+    if (Array.isArray(contents.parts)) {
+      return contents.parts.some((p: any) => Boolean(p?.inlineData));
+    }
+  }
+  return false;
+}
+
+/**
+ * Gets an optimal sequence of active text models to try, prioritizing those not on active cooldown.
  */
 export function getOptimalModelSequence(requestedModel: string): string[] {
+  const normalizedRequested =
+    requestedModel === 'gemini-3.5-flash' || requestedModel === 'gemini-flash-latest'
+      ? 'gemini-4-hydrogen'
+      : requestedModel;
+
   const allModels = [
-    requestedModel,
-    'gemini-3.5-flash',
-    'gemini-3.1-flash-lite',
-    'gemini-flash-latest'
+    normalizedRequested,
+    'gemini-4-hydrogen',
+    'gemini-3.1-flash-lite'
   ];
   const uniqueModels = allModels.filter((v, i, a) => a.indexOf(v) === i);
   const now = Date.now();
@@ -61,8 +107,8 @@ export function getOptimalModelSequence(requestedModel: string): string[] {
       return cooldownA - cooldownB; // Prefer the one whose cooldown expires sooner
     }
     
-    if (a === requestedModel) return -1;
-    if (b === requestedModel) return 1;
+    if (a === normalizedRequested) return -1;
+    if (b === normalizedRequested) return 1;
     return 0;
   });
 
@@ -74,13 +120,23 @@ export function getOptimalModelSequence(requestedModel: string): string[] {
  */
 export async function callGeminiWithRetry<T>(
   fn: () => Promise<T>,
-  retries = 3,
-  delay = 1000
+  retries = 2,
+  delay = 800
 ): Promise<T> {
   try {
     return await fn();
   } catch (error: any) {
     const errorStr = String(error).toLowerCase();
+    const isNotFound =
+      error?.status === 404 ||
+      errorStr.includes('404') ||
+      errorStr.includes('not_found') ||
+      errorStr.includes('is not found');
+
+    if (isNotFound) {
+      throw error;
+    }
+
     const isTransient =
       error?.status === 503 ||
       error?.status === 429 ||
@@ -91,8 +147,7 @@ export async function callGeminiWithRetry<T>(
       errorStr.includes('service unavailable') ||
       errorStr.includes('resource exhausted') ||
       errorStr.includes('resource_exhausted') ||
-      errorStr.includes('busy') ||
-      errorStr.includes('limit');
+      errorStr.includes('busy');
 
     if (isTransient && retries > 0) {
       console.warn(`[GEMINI] Transient error detected. Retrying in ${delay}ms... (${retries} attempts left).`);
@@ -167,7 +222,7 @@ export function extractPromptText(contents: any): string {
 }
 
 /**
- * Invokes Gemini content generation with multi-model fallback in case of rate limits or transient errors.
+ * Invokes Gemini content generation with multi-model fallback, timeout guards, and rate-limit cooldowns.
  * If Gemini models are exhausted or key is missing, automatically cascades to Groq (Llama 3.3 70B / 3.1 8B).
  */
 export async function generateContentWithFallback(
@@ -178,7 +233,7 @@ export async function generateContentWithFallback(
     model?: string;
   }
 ): Promise<any> {
-  const requestedModel = params.model || 'gemini-3.5-flash';
+  const requestedModel = params.model || 'gemini-4-hydrogen';
   let lastError: any = null;
 
   // Tier 1: Try Gemini models sequence if client is initialized
@@ -188,21 +243,46 @@ export async function generateContentWithFallback(
     for (let idx = 0; idx < modelsToTry.length; idx++) {
       const currentModel = modelsToTry[idx];
       try {
+        const sanitizedConfig = sanitizeConfigForModel(currentModel, params.config);
         const response = await callGeminiWithRetry(async () => {
-          return await ai.models.generateContent({
-            ...params,
-            model: currentModel
+          let timerId: NodeJS.Timeout | undefined;
+          const timeoutPromise = new Promise<never>((_, reject) => {
+            timerId = setTimeout(
+              () => reject(new Error(`Gemini model "${currentModel}" timed out after ${GEMINI_CALL_TIMEOUT_MS / 1000}s`)),
+              GEMINI_CALL_TIMEOUT_MS
+            );
           });
-        }, 2, 800);
+          try {
+            return await Promise.race([
+              ai.models.generateContent({
+                ...params,
+                config: sanitizedConfig,
+                model: currentModel
+              }),
+              timeoutPromise
+            ]);
+          } finally {
+            if (timerId) clearTimeout(timerId);
+          }
+        }, 1, 800);
         
         return response;
       } catch (err: any) {
+        const errStr = String(err).toLowerCase();
+        const isNotFound =
+          err?.status === 404 ||
+          errStr.includes('404') ||
+          errStr.includes('not_found') ||
+          errStr.includes('is not found');
         const isRateLimit =
-          String(err).includes('429') ||
-          String(err).toLowerCase().includes('quota') ||
-          String(err).toLowerCase().includes('resource_exhausted');
+          err?.status === 429 ||
+          errStr.includes('429') ||
+          errStr.includes('quota') ||
+          errStr.includes('resource_exhausted');
         
-        if (isRateLimit) {
+        if (isNotFound) {
+          modelCooldowns.set(currentModel, Date.now() + UNAVAILABLE_COOLDOWN_MS);
+        } else if (isRateLimit) {
           modelCooldowns.set(currentModel, Date.now() + GLOBAL_COOLDOWN_MS);
         }
 
@@ -212,8 +292,8 @@ export async function generateContentWithFallback(
     }
   }
 
-  // Tier 2: Groq Inference Engine Fallback (Llama 3.3 70B -> Llama 3.1 8B Instant)
-  if (isGroqConfigured()) {
+  // Tier 2: Groq Inference Engine Fallback (skip if binary inlineData like PDF/image is required)
+  if (isGroqConfigured() && !hasBinaryInlineData(params.contents)) {
     try {
       console.log('[AI FALLBACK] Gemini models unavailable or exhausted. Seamlessly routing to Groq...');
       const promptText = extractPromptText(params.contents);
@@ -312,7 +392,7 @@ Output strictly in JSON matching the schema.`;
         }
       });
 
-      const parsed = JSON.parse(response.text?.trim() || '{}');
+      const parsed = cleanAndParseJSON(response.text);
       if (typeof parsed.needsFollowUp === 'boolean') {
         return {
           needsFollowUp: parsed.needsFollowUp,

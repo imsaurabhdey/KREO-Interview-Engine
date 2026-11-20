@@ -11,8 +11,52 @@ import { getDb, saveDb } from '../db';
 import { Assessment, Question } from '../types';
 import { getGeminiClient, generateContentWithFallback, cleanAndParseJSON, isGroqConfigured } from '../gemini';
 import { extractSkillsOffline, generateAssessmentQuestions } from '../questionGenerator';
+import { requireAuth, requireRole, canAccessOrg, logAuditEvent } from '../authMiddleware';
 
 export const assessmentRouter = Router();
+
+// Require verified Recruiter/Admin session across all assessment routes
+assessmentRouter.use(requireAuth);
+
+const VALID_ASSESSMENT_STATUSES = new Set(['Draft', 'Published', 'Closed']);
+const ALLOWED_STATUS_TRANSITIONS: Record<string, Set<string>> = {
+  Draft: new Set(['Draft', 'Published', 'Closed']),
+  Published: new Set(['Published', 'Closed', 'Draft']),
+  Closed: new Set(['Closed', 'Published'])
+};
+
+function validateAssessmentFields(body: any, isUpdate = false): string | null {
+  if (body.title !== undefined) {
+    if (typeof body.title !== 'string' || body.title.trim().length > 200) {
+      return 'Assessment title must be a string of at most 200 characters.';
+    }
+    if (!isUpdate && body.title.trim().length === 0) {
+      return 'Assessment title cannot be empty.';
+    }
+  }
+  if (body.status !== undefined && !VALID_ASSESSMENT_STATUSES.has(body.status)) {
+    return 'Invalid assessment status. Allowed values: Draft, Published, Closed.';
+  }
+  if (body.techCount !== undefined) {
+    const n = Number(body.techCount);
+    if (!Number.isFinite(n) || n < 0 || n > 50) {
+      return 'techCount must be a number between 0 and 50.';
+    }
+  }
+  if (body.codingCount !== undefined) {
+    const n = Number(body.codingCount);
+    if (!Number.isFinite(n) || n < 0 || n > 20) {
+      return 'codingCount must be a number between 0 and 20.';
+    }
+  }
+  if (body.questions !== undefined && !Array.isArray(body.questions)) {
+    return 'questions must be an array.';
+  }
+  if (body.jdText !== undefined && typeof body.jdText !== 'string') {
+    return 'jdText must be a string.';
+  }
+  return null;
+}
 
 // Extract Skills from JD Endpoint
 assessmentRouter.post('/extract-skills', async (req, res) => {
@@ -147,17 +191,18 @@ Output format JSON:
   res.json({ query, aiSuggestions });
 });
 
-// Get all assessments endpoint
+// Get all assessments scoped to caller's organization
 assessmentRouter.get('/', (req, res) => {
   const db = getDb();
-  res.json(db.assessments || []);
+  const scoped = (db.assessments || []).filter((a) => canAccessOrg(req.authUser!, a.orgName));
+  res.json(scoped);
 });
 
-// Get single assessment by ID
+// Get single assessment by ID (scoped to caller's organization)
 assessmentRouter.get('/:id', (req, res) => {
   const { id } = req.params;
   const db = getDb();
-  const asmt = (db.assessments || []).find(a => a.id === id);
+  const asmt = (db.assessments || []).find((a) => a.id === id && canAccessOrg(req.authUser!, a.orgName));
   if (!asmt) {
     return res.status(404).json({ error: 'Assessment not found.' });
   }
@@ -182,23 +227,17 @@ assessmentRouter.post('/', (req, res) => {
     status = 'Published'
   } = req.body;
 
-  const db = getDb();
+  const validationErr = validateAssessmentFields(req.body, false);
+  if (validationErr) {
+    return res.status(400).json({ error: validationErr });
+  }
 
-  let resolvedName = req.body.createdByName;
-  if (req.body.createdByEmail) {
-    const accountMatch = (db.accounts || []).find((a: any) => a.email && a.email.toLowerCase().trim() === req.body.createdByEmail.toLowerCase().trim());
-    if (accountMatch && accountMatch.name) {
-      resolvedName = accountMatch.name;
-    }
-  }
-  if (!resolvedName && req.body.createdByEmail) {
-    const parts = req.body.createdByEmail.split('@')[0].split(/[._-]/);
-    resolvedName = parts.map((p: string) => p.charAt(0).toUpperCase() + p.slice(1)).join(' ');
-  }
+  const db = getDb();
+  const now = new Date().toISOString();
 
   const newAsmt: Assessment = {
     id: `asmt-${Date.now()}`,
-    title: title || 'Custom Assessment',
+    title: (title || 'Custom Assessment').trim(),
     roleLevel,
     experienceRequired,
     jdText: jdText || 'Custom Requisition',
@@ -206,9 +245,22 @@ assessmentRouter.post('/', (req, res) => {
     mandatorySkills,
     goodToHaveSkills,
     status,
-    createdAt: new Date().toISOString(),
-    createdByEmail: req.body.createdByEmail || undefined,
-    createdByName: resolvedName || 'Saurabh Dey',
+    createdAt: now,
+    createdByEmail: req.authUser!.email,
+    createdByName: req.authUser!.name,
+    updatedAt: now,
+    updatedByEmail: req.authUser!.email,
+    updatedByName: req.authUser!.name,
+    orgName: req.authUser!.orgName,
+    auditHistory: [
+      {
+        action: 'CREATED',
+        actorEmail: req.authUser!.email,
+        actorName: req.authUser!.name,
+        timestamp: now,
+        summary: `Created assessment (${status})`
+      }
+    ],
     questions,
     techCount,
     codingCount,
@@ -219,6 +271,7 @@ assessmentRouter.post('/', (req, res) => {
   if (!db.assessments) db.assessments = [];
   db.assessments.unshift(newAsmt);
   saveDb(db, true);
+  logAuditEvent('ASSESSMENT_CREATE', req.authUser!, { assessmentId: newAsmt.id, title: newAsmt.title });
   res.status(201).json(newAsmt);
 });
 
@@ -254,22 +307,11 @@ assessmentRouter.post('/generate-from-jd', async (req, res) => {
   });
 
   const db = getDb();
-
-  let resolvedName = req.body.createdByName;
-  if (req.body.createdByEmail) {
-    const accountMatch = (db.accounts || []).find((a: any) => a.email && a.email.toLowerCase().trim() === req.body.createdByEmail.toLowerCase().trim());
-    if (accountMatch && accountMatch.name) {
-      resolvedName = accountMatch.name;
-    }
-  }
-  if (!resolvedName && req.body.createdByEmail) {
-    const parts = req.body.createdByEmail.split('@')[0].split(/[._-]/);
-    resolvedName = parts.map((p: string) => p.charAt(0).toUpperCase() + p.slice(1)).join(' ');
-  }
+  const now = new Date().toISOString();
 
   const generatedAssessment: Assessment = {
     id: `asmt-${Date.now()}`,
-    title: title || 'Custom Role Assessment',
+    title: (title || 'Custom Role Assessment').trim(),
     roleLevel: roleLevel || 'Mid-Level',
     experienceRequired: experienceRequired || 'Flexible',
     jdText,
@@ -277,9 +319,22 @@ assessmentRouter.post('/generate-from-jd', async (req, res) => {
     mandatorySkills,
     goodToHaveSkills,
     status: 'Draft',
-    createdAt: new Date().toISOString(),
-    createdByEmail: req.body.createdByEmail || undefined,
-    createdByName: resolvedName || 'Saurabh Dey',
+    createdAt: now,
+    createdByEmail: req.authUser!.email,
+    createdByName: req.authUser!.name,
+    updatedAt: now,
+    updatedByEmail: req.authUser!.email,
+    updatedByName: req.authUser!.name,
+    orgName: req.authUser!.orgName,
+    auditHistory: [
+      {
+        action: 'GENERATED',
+        actorEmail: req.authUser!.email,
+        actorName: req.authUser!.name,
+        timestamp: now,
+        summary: `Generated draft assessment with ${finalQuestionsBank.length} questions`
+      }
+    ],
     questions: finalQuestionsBank,
     techCount,
     codingCount,
@@ -290,57 +345,81 @@ assessmentRouter.post('/generate-from-jd', async (req, res) => {
   if (!db.assessments) db.assessments = [];
   db.assessments.unshift(generatedAssessment);
   saveDb(db, true);
+  logAuditEvent('ASSESSMENT_GENERATE', req.authUser!, { assessmentId: generatedAssessment.id });
   res.json(generatedAssessment);
 });
 
-// Update Assessment to Publish/Draft state
+// Update Assessment to Publish/Draft/Closed state (validated & audited, scoped to organization)
 assessmentRouter.put('/:id', (req, res) => {
   const { id } = req.params;
-  const { status, title, questions, hrCount, techCount, codingCount, mandatorySkills, goodToHaveSkills, skillsExtracted, locations, roundsEnabled } = req.body;
+  const { status, title, questions, techCount, codingCount, mandatorySkills, goodToHaveSkills, skillsExtracted, locations, roundsEnabled } = req.body;
+
+  const validationErr = validateAssessmentFields(req.body, true);
+  if (validationErr) {
+    return res.status(400).json({ error: validationErr });
+  }
 
   const db = getDb();
-  const asmtIndex = db.assessments.findIndex(a => a.id === id);
+  const asmtIndex = db.assessments.findIndex((a) => a.id === id && canAccessOrg(req.authUser!, a.orgName));
   if (asmtIndex === -1) {
     return res.status(404).json({ error: 'Assessment not found.' });
   }
 
-  if (status) db.assessments[asmtIndex].status = status;
-  if (title) db.assessments[asmtIndex].title = title;
-  if (questions) db.assessments[asmtIndex].questions = questions;
-  if (techCount !== undefined) db.assessments[asmtIndex].techCount = techCount;
-  if (codingCount !== undefined) db.assessments[asmtIndex].codingCount = codingCount;
-  if (mandatorySkills !== undefined) db.assessments[asmtIndex].mandatorySkills = mandatorySkills;
-  if (goodToHaveSkills !== undefined) db.assessments[asmtIndex].goodToHaveSkills = goodToHaveSkills;
-  if (skillsExtracted !== undefined) db.assessments[asmtIndex].skillsExtracted = skillsExtracted;
-  if (locations !== undefined) db.assessments[asmtIndex].locations = locations;
-  if (roundsEnabled !== undefined) db.assessments[asmtIndex].roundsEnabled = roundsEnabled;
+  const existing = db.assessments[asmtIndex];
+  const currentStatus = existing.status || 'Draft';
+
+  if (status !== undefined) {
+    const allowedNext = ALLOWED_STATUS_TRANSITIONS[currentStatus] || VALID_ASSESSMENT_STATUSES;
+    if (!allowedNext.has(status)) {
+      return res.status(400).json({
+        error: `Invalid state transition: Cannot move assessment directly from "${currentStatus}" to "${status}".`
+      });
+    }
+    existing.status = status;
+  }
+
+  if (title !== undefined) existing.title = title.trim();
+  if (questions !== undefined) existing.questions = questions;
+  if (techCount !== undefined) existing.techCount = Number(techCount);
+  if (codingCount !== undefined) existing.codingCount = Number(codingCount);
+  if (mandatorySkills !== undefined) existing.mandatorySkills = mandatorySkills;
+  if (goodToHaveSkills !== undefined) existing.goodToHaveSkills = goodToHaveSkills;
+  if (skillsExtracted !== undefined) existing.skillsExtracted = skillsExtracted;
+  if (locations !== undefined) existing.locations = locations;
+  if (roundsEnabled !== undefined) existing.roundsEnabled = roundsEnabled;
+
+  const now = new Date().toISOString();
+  existing.updatedAt = now;
+  existing.updatedByEmail = req.authUser!.email;
+  existing.updatedByName = req.authUser!.name;
+  const history = Array.isArray(existing.auditHistory) ? existing.auditHistory : [];
+  history.push({
+    action: status && status !== currentStatus ? `STATUS_${status.toUpperCase()}` : 'UPDATED',
+    actorEmail: req.authUser!.email,
+    actorName: req.authUser!.name,
+    timestamp: now,
+    summary: status && status !== currentStatus
+      ? `Status changed from ${currentStatus} to ${status}`
+      : 'Updated assessment configuration'
+  });
+  existing.auditHistory = history.slice(-30);
 
   saveDb(db, true);
-  res.json(db.assessments[asmtIndex]);
+  logAuditEvent('ASSESSMENT_UPDATE', req.authUser!, { assessmentId: id, status: existing.status });
+  res.json(existing);
 });
 
-// Delete Assessment (Admin Only)
-assessmentRouter.delete('/:id', (req, res) => {
+// Delete Assessment (Verified Admin Role Only — never trusts client headers)
+assessmentRouter.delete('/:id', requireRole('Admin'), (req, res) => {
   const { id } = req.params;
-  const userRoleHeader = req.headers['x-user-role'];
-  const userEmailHeader = req.headers['x-user-email'];
-
   const db = getDb();
-
-  let role = (Array.isArray(userRoleHeader) ? userRoleHeader[0] : userRoleHeader) || '';
-  if (!role && userEmailHeader) {
-    const emailStr = (Array.isArray(userEmailHeader) ? userEmailHeader[0] : userEmailHeader).toLowerCase().trim();
-    const matched = (db.accounts || []).find((acc: any) => acc.email && acc.email.toLowerCase().trim() === emailStr);
-    if (matched) {
-      role = matched.role;
-    }
+  const target = (db.assessments || []).find((a) => a.id === id && canAccessOrg(req.authUser!, a.orgName));
+  if (!target) {
+    return res.status(404).json({ error: 'Assessment not found.' });
   }
 
-  if (role && role !== 'Admin') {
-    return res.status(403).json({ error: 'Access Denied: Only Administrators are authorized to delete assessments.' });
-  }
-
-  db.assessments = db.assessments.filter(a => a.id !== id);
+  db.assessments = db.assessments.filter((a) => a.id !== id);
   saveDb(db, true);
+  logAuditEvent('ASSESSMENT_DELETE', req.authUser!, { assessmentId: id, title: target.title });
   res.json({ success: true });
 });

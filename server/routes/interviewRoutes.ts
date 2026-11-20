@@ -8,109 +8,24 @@
 import { Router } from 'express';
 import { Type } from '@google/genai';
 import { getDb, saveDb, shuffleWithSeed } from '../db';
-import { getGeminiClient, generateContentWithFallback, evaluateNeedsFollowUp } from '../gemini';
-import { executeCodeSandbox } from '../codeExecution';
+import { getGeminiClient, generateContentWithFallback, cleanAndParseJSON, evaluateNeedsFollowUp, isGroqConfigured } from '../gemini';
+import { executeCodeSandbox, MAX_CODE_BYTES, resolveSupportedLanguage } from '../codeExecution';
 import { upload, uploadToR2 } from '../s3Storage';
 import { sendCandidateEmail } from '../emailService';
-import { queueCandidateForEvaluation } from '../evaluationService';
+import { finalizeInterviewEvaluation, evaluateAnswerQuality } from '../evaluationService';
+import { tryAuthenticateRequest } from '../authMiddleware';
+import { createRateLimiter } from '../securityMiddleware';
 
+export { evaluateAnswerQuality };
 export const interviewRouter = Router();
 
-/**
- * Uncompromising Answer Quality Evaluator.
- * Analyzes candidate responses with absolute realism:
- * - Single-word / Evasive / Superficial / "Yes-No" answers -> Score: 0% - 10%
- * - Broken / Syntax-error code -> Score: 0% - 20%
- * - Partial answer without depth/edge-cases -> Score: 40% - 60%
- * - Detailed, correct, well-structured response -> Score: 75% - 95%
- */
-export function evaluateAnswerQuality(
-  answer: string,
-  category: string = 'tech',
-  questionText: string = ''
-): { score: number; feedback: string; isSuperficial: boolean } {
-  if (!answer || typeof answer !== 'string') {
-    return {
-      score: 0,
-      feedback: 'Candidate provided no response or submitted an empty answer.',
-      isSuperficial: true
-    };
-  }
-
-  const clean = answer.trim().toLowerCase();
-  const words = clean.split(/\s+/).filter(w => w.length > 0);
-  const wordCount = words.length;
-
-  const superficialPhrases = [
-    'yes', 'no', 'yeah', 'nope', 'ok', 'okay', 'idk', 'dunno', 'i don\'t know', 'i dont know',
-    'pass', 'skip', 'sure', 'fine', 'hi', 'hello', 'maybe', 'not sure', 'nothing', 'na', 'n/a',
-    'yes sir', 'no sir', 'yes maam', 'yes i know', 'no i dont', 'yes i can', 'no i cant'
-  ];
-
-  const isExactSuperficial = superficialPhrases.includes(clean);
-  const isCodeKeyword = clean.includes('function') || clean.includes('return') || clean.includes('const') || clean.includes('class') || clean.includes('import') || clean.includes('def ') || clean.includes('for');
-  const isTooShort = wordCount <= 4 && !isCodeKeyword;
-
-  if (isExactSuperficial || isTooShort) {
-    return {
-      score: 5,
-      feedback: `Unsatisfactory answer. Candidate responded with only "${answer.trim()}" without providing any technical explanation, algorithm logic, or code implementation. Fails skill requirements.`,
-      isSuperficial: true
-    };
-  }
-
-  if (category === 'coding') {
-    const hasCodeStructure = clean.includes('def ') || clean.includes('function') || clean.includes('const ') || 
-                             clean.includes('var ') || clean.includes('let ') || clean.includes('return') || 
-                             clean.includes('class ') || clean.includes('import ') || clean.includes('for(') || 
-                             clean.includes('for ') || clean.includes('while') || clean.includes('=>') || 
-                             clean.includes('if(') || clean.includes('if ') || clean.includes('{') || clean.includes(';');
-
-    if (!hasCodeStructure) {
-      return {
-        score: 10,
-        feedback: `Errors in code submission. Candidate provided prose ("${answer.substring(0, 50)}...") instead of executable source code logic. Solution is unsuitable for production requirements.`,
-        isSuperficial: false
-      };
-    }
-
-    if (wordCount < 20) {
-      return {
-        score: 30,
-        feedback: `Code submission is incomplete or contains syntax/logic bugs and lacks required edge-case handling.`,
-        isSuperficial: false
-      };
-    }
-
-    return {
-      score: 75,
-      feedback: `Candidate submitted a structured code solution. Logic passes core structure checks.`,
-      isSuperficial: false
-    };
-  }
-
-  if (wordCount < 10) {
-    return {
-      score: 20,
-      feedback: `Candidate answer is extremely brief (${wordCount} words) and lacks core technical concepts or architectural reasoning for this skill.`,
-      isSuperficial: true
-    };
-  }
-
-  if (wordCount < 25) {
-    return {
-      score: 50,
-      feedback: `Candidate provided a basic answer but missed critical depth, efficiency trade-offs, and boundary conditions required for ${questionText.substring(0, 40) || 'this topic'}.`,
-      isSuperficial: false
-    };
-  }
-
-  return {
-    score: 80,
-    feedback: `Candidate provided a structured technical explanation covering core principles.`,
-    isSuperficial: false
-  };
-}
+const codeExecutionLimiter = createRateLimiter({
+  windowMs: 5 * 60 * 1000,
+  max: 15,
+  keyPrefix: 'code-exec',
+  keyGenerator: (req) => `${req.params.token || 'unknown'}:${req.ip || 'ip'}`,
+  message: 'Code execution rate limit reached (max 15 runs per 5 minutes). Please wait before running again.'
+});
 
 // Validate Candidate Token & Fetch Customized Assessment (supports both /:token/validate and /validate/:token)
 interviewRouter.get(['/:token/validate', '/validate/:token'], (req, res) => {
@@ -182,7 +97,7 @@ interviewRouter.post('/:token/clarify-question', async (req, res) => {
   let clarificationText = "I am looking to understand your high-level conceptual approach or design options for this scenario. Could you share your thoughts on the general solution?";
   let speechText = "Sure! I would be glad to help clarify. I am interested in understanding your high-level engineering approach or how you model this scenario. Could you share your general thoughts?";
 
-  if (ai) {
+  if (ai || isGroqConfigured()) {
     try {
       const promptText = `
 Candidate is sitting for an interview and finds this question hard to understand or needs some guidance.
@@ -215,7 +130,7 @@ Instructions for Clarification:
         }
       });
 
-      const parsed = JSON.parse(response.text?.trim() || '{}');
+      const parsed = cleanAndParseJSON(response.text);
       clarificationText = parsed.clarification ?? clarificationText;
       speechText = parsed.speech ?? speechText;
     } catch (err) {
@@ -397,169 +312,30 @@ interviewRouter.post('/:token/evaluate-answer', async (req, res) => {
   }
 });
 
-// Finalize Candidate Interview & Trigger Full Report Compilation
+// Finalize Candidate Interview & Delegate to Single Evaluation Pipeline
 interviewRouter.post('/:token/complete', async (req, res) => {
   const { token } = req.params;
-  const { transcripts, proctoringSummary, isSuspended, clientCheatingLogs } = req.body;
+  const { transcripts, proctoringSummary, isSuspended, clientCheatingLogs } = req.body || {};
 
-  const db = getDb();
-  const candIndex = db.candidates.findIndex((c) => c.token === token);
-  if (candIndex === -1) {
+  const result = finalizeInterviewEvaluation({
+    candidateToken: token,
+    clientTranscripts: Array.isArray(transcripts) ? transcripts : undefined,
+    proctoringSummary,
+    isSuspended: Boolean(isSuspended),
+    clientCheatingLogs: Array.isArray(clientCheatingLogs) ? clientCheatingLogs : undefined,
+    queueAiAsync: true
+  });
+
+  if (!result) {
     return res.status(404).json({ error: 'Candidate not found.' });
   }
 
-  const candidate = db.candidates[candIndex];
-  const assessment = db.assessments.find((a) => a.id === candidate.assessmentId);
-
-  let technicalScore = 70;
-  let communicationScore = 75;
-  let problemSolvingScore = 70;
-  let summary = 'The candidate completed all sections of the interview.';
-  let cheatingRisk: 'Low' | 'Medium' | 'High' = 'Low';
-  let decision: 'Strong Hire' | 'Hire' | 'Neutral' | 'Reject' = 'Hire';
-
-  const cheatingLogs: string[] = Array.isArray(clientCheatingLogs) ? [...clientCheatingLogs] : [];
-
-  if (proctoringSummary) {
-    if (proctoringSummary.tabSwitches > 5 || proctoringSummary.browserFocusViolations > 8) {
-      cheatingRisk = 'High';
-      decision = 'Reject';
-      cheatingLogs.push(`High Tab Switching Events (${proctoringSummary.tabSwitches} blurs). Possible third-party code lookup detected.`);
-    } else if (proctoringSummary.tabSwitches > 0) {
-      cheatingLogs.push(`Suspicion: Tab Switch detected (${proctoringSummary.tabSwitches} switches).`);
-    }
-
-    if (proctoringSummary.copyPasteAttempts > 0) {
-      cheatingRisk = 'High';
-      cheatingLogs.push(`Security Alert: Intercepted ${proctoringSummary.copyPasteAttempts} clipboard copy/paste attempts. Operation forbidden.`);
-    }
-
-    if (proctoringSummary.cameraOffViolations > 0) {
-      cheatingRisk = 'High';
-      decision = 'Reject';
-      cheatingLogs.push(`Device Compliance Failed: Camera feed signal was intentionally disabled or lost (${proctoringSummary.cameraOffViolations} times).`);
-    }
-
-    if (proctoringSummary.notVisibleViolations > 0) {
-      cheatingLogs.push(`AI Gaze Alert: Candidate was looking off-screen constantly or head was completely removed from the camera feed (${proctoringSummary.notVisibleViolations} times logged by eye-movement tracker).`);
-      if (proctoringSummary.notVisibleViolations > 3) {
-        cheatingRisk = 'High';
-      } else if (cheatingRisk !== 'High') {
-        cheatingRisk = 'Medium';
-      }
-    }
-
-    if (proctoringSummary.faceDetectionsLost > 5) {
-      cheatingLogs.push(`Gaze Deviancy Logged: Standard AI eye center face mesh coordinate drift registered.`);
-    }
-  }
-
-  if (isSuspended) {
-    cheatingRisk = 'High';
-    decision = 'Reject';
-    cheatingLogs.push('System aborted candidate test workspace immediately due to minimizing, exiting full screen, or other safety violations.');
-  }
-
-  const activeTranscripts = transcripts || candidate.feedbackReport?.transcripts || [];
-
-  let totalTechScore = 0;
-  let techCount = 0;
-  let totalCodeScore = 0;
-  let codeCount = 0;
-  let totalSuperficialAnswers = 0;
-
-  activeTranscripts.forEach((t: any) => {
-    if (t.category !== 'intro' && t.questionId !== 'intro-q1') {
-      const fullAns = `${t.candidateAnswer || ''} ${t.crossAnswerText || ''}`.trim();
-      const evalRes = evaluateAnswerQuality(fullAns, t.category, t.questionText);
-      
-      t.score = evalRes.score;
-      t.aiEvaluation = evalRes.feedback;
-      if (t.crossAnswerText) {
-        t.crossAiEvaluation = evalRes.feedback;
-      }
-
-      if (evalRes.isSuperficial) {
-        totalSuperficialAnswers++;
-      }
-
-      if (t.category === 'coding') {
-        totalCodeScore += evalRes.score;
-        codeCount++;
-      } else {
-        totalTechScore += evalRes.score;
-        techCount++;
-      }
-    }
-  });
-
-  if (techCount > 0) {
-    technicalScore = Math.round(totalTechScore / techCount);
-  } else {
-    technicalScore = 0;
-  }
-
-  if (codeCount > 0) {
-    problemSolvingScore = Math.round(totalCodeScore / codeCount);
-  } else {
-    problemSolvingScore = technicalScore;
-  }
-
-  if (totalSuperficialAnswers > 0) {
-    communicationScore = Math.max(10, Math.min(40, 50 - (totalSuperficialAnswers * 15)));
-  } else {
-    communicationScore = Math.round((technicalScore + problemSolvingScore) / 2);
-  }
-
-  const overallFitmentAvg = Math.max(0, Math.min(100, Math.round(technicalScore * 0.5 + problemSolvingScore * 0.25 + communicationScore * 0.25)));
-
-  if (isSuspended) {
-    summary = 'REJECT: Proctor terminated test midway due to critical security violations.';
-    decision = 'Reject';
-  } else if (totalSuperficialAnswers >= 2 || overallFitmentAvg < 55) {
-    decision = 'Reject';
-    summary = `REJECT: Candidate failed technical evaluation (${overallFitmentAvg}% fitment). Answers were single-word or superficial ('Yes/No') without technical depth or reasoning.`;
-  } else if (overallFitmentAvg >= 85) {
-    decision = 'Strong Hire';
-    summary = `STRONG HIRE: Candidate demonstrated strong technical depth, clear communication, and correct code implementation (${overallFitmentAvg}% fitment).`;
-  } else if (overallFitmentAvg >= 75) {
-    decision = 'Hire';
-    summary = `HIRE: Candidate met technical competency benchmarks with satisfactory problem-solving and communication skills (${overallFitmentAvg}% fitment).`;
-  } else {
-    decision = 'Reject';
-    summary = `REJECT: Candidate scored ${overallFitmentAvg}%, failing the 75% selection benchmark. Demonstrated knowledge gaps in core required skills.`;
-  }
-
-  const initialDecision = isSuspended ? 'Reject' : (totalSuperficialAnswers >= 2 || overallFitmentAvg < 55 ? 'Reject' : 'Review Pending');
-
-  candidate.status = isSuspended ? 'Suspended' : 'Completed';
-  candidate.completedAt = new Date().toISOString();
-  candidate.proctoringSummary = proctoringSummary || { tabSwitches: 0, browserFocusViolations: 0, faceDetectionsLost: 0 };
-  candidate.feedbackReport = {
-    decision: initialDecision,
-    summary,
-    technicalScore,
-    communicationScore,
-    problemSolvingScore,
-    cheatingRisk,
-    cheatingLogs,
-    transcripts: activeTranscripts
-  };
-  candidate.aiAssessmentScore = overallFitmentAvg;
-
-  db.candidates[candIndex] = candidate;
-  saveDb(db);
-
-  const ai = getGeminiClient();
-  if (ai && !isSuspended && activeTranscripts.length > 0) {
-    queueCandidateForEvaluation(candidate.token, activeTranscripts, proctoringSummary, isSuspended);
-  }
-
+  const { candidate, assessment } = result;
   const startLink = `${process.env.APP_URL || 'http://localhost:3000'}/?token=${candidate.token}`;
   sendCandidateEmail(candidate.email, candidate.name, 'COMPLETED', {
     assessmentTitle: assessment?.title,
     startLink
-  }).catch((err) => console.error("Async candidate completed email dispatch error:", err));
+  }).catch((err) => console.error('Async candidate completed email dispatch error:', err));
 
   res.json(candidate);
 });
@@ -604,22 +380,58 @@ interviewRouter.post('/:token/upload-recording', upload.single('recording'), asy
   });
 });
 
-// Execute Candidate Code in Sandbox
-interviewRouter.post('/:token/execute-code', async (req, res) => {
-  const { code, language } = req.body;
+// Execute Candidate Code in Sandbox (token/session authorized, size-capped, rate-limited)
+interviewRouter.post('/:token/execute-code', codeExecutionLimiter, async (req, res) => {
+  const { token } = req.params;
+  const { code, language = 'javascript' } = req.body;
 
-  if (!code || typeof code !== 'string') {
+  // 1. Verify active candidate interview token OR authenticated Recruiter/Admin demo session
+  if (token === 'demo' || token === 'demo-test-token') {
+    const authUser = tryAuthenticateRequest(req);
+    if (!authUser) {
+      return res.status(401).json({ error: 'Demo code execution requires an authenticated Recruiter or Admin session.' });
+    }
+  } else {
+    const db = getDb();
+    const candidate = (db.candidates || []).find((c) => c.token === token);
+    if (!candidate) {
+      return res.status(401).json({ error: 'Invalid or unauthorized interview session token.' });
+    }
+
+    if (candidate.status === 'Completed' || candidate.status === 'Suspended') {
+      return res.status(403).json({ error: 'Code execution is disabled because this interview session is closed.' });
+    }
+
+    const asmt = (db.assessments || []).find((a) => a.id === candidate.assessmentId);
+    if (asmt && asmt.status === 'Closed') {
+      return res.status(403).json({ error: 'Code execution is disabled because this assessment has been closed.' });
+    }
+  }
+
+  // 2. Validate code payload & size cap
+  if (!code || typeof code !== 'string' || !code.trim()) {
     return res.status(400).json({ error: 'Code content is required.' });
   }
 
+  if (Buffer.byteLength(code, 'utf-8') > MAX_CODE_BYTES) {
+    return res.status(413).json({
+      error: `Code payload exceeds the ${Math.floor(MAX_CODE_BYTES / 1000)} KB execution limit.`
+    });
+  }
+
+  // 3. Validate supported runtime language
+  if (!resolveSupportedLanguage(String(language))) {
+    return res.status(400).json({ error: `Unsupported programming language: "${language}".` });
+  }
+
   try {
-    const data = await executeCodeSandbox(code, language);
+    const data = await executeCodeSandbox(code, String(language));
     res.json(data);
   } catch (error: any) {
-    console.error('[CODE_EXECUTION_ERROR]', error);
-    res.status(500).json({
-      error: 'Execution request failed',
-      details: error.message
+    console.error('[CODE_EXECUTION_ERROR]', error?.message || error);
+    res.status(502).json({
+      error: 'External code execution sandbox failed',
+      details: error?.message || 'Execution timeout or upstream error'
     });
   }
 });

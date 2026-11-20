@@ -1,0 +1,422 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Automated Security, Authorization, Privacy, Validation & Code-Execution Test Suite.
+ * Runs against an isolated temporary DB file so live db.json is never modified.
+ */
+
+import test, { before, after } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import http from 'node:http';
+import { hashPassword, resetDbCacheForTests } from '../server/db';
+import { createApp } from '../server';
+
+const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kreo-security-test-'));
+const tempDbPath = path.join(tmpDir, 'test-db.json');
+
+process.env.DB_PATH_OVERRIDE = tempDbPath;
+process.env.SESSION_SECRET = 'test-session-secret-for-automated-suite-32chars';
+
+let server: http.Server;
+let baseUrl = '';
+let adminToken = '';
+let recruiterToken = '';
+let otherOrgToken = '';
+
+const seededDb = {
+  accounts: [
+    {
+      id: 'usr-admin-1',
+      name: 'Saurabh Dey',
+      email: 'saurabh.dey@irissoftware.com',
+      passwordHash: hashPassword('AdminPass!123'),
+      role: 'Admin',
+      orgName: 'Kreo Software',
+      createdAt: new Date().toISOString()
+    },
+    {
+      id: 'usr-rec-1',
+      name: 'Recruiter One',
+      email: 'recruiter@irissoftware.com',
+      passwordHash: hashPassword('RecPass!123'),
+      role: 'Recruiter',
+      orgName: 'Kreo Software',
+      createdAt: new Date().toISOString()
+    },
+    {
+      id: 'usr-other-org',
+      name: 'External Recruiter',
+      email: 'lead@othercorp.com',
+      passwordHash: hashPassword('OtherPass!123'),
+      role: 'Admin',
+      orgName: 'Other Corp',
+      createdAt: new Date().toISOString()
+    }
+  ],
+  assessments: [
+    {
+      id: 'asmt-org-a',
+      title: 'Backend Engineer',
+      roleLevel: 'Senior',
+      experienceRequired: '5+ Years',
+      jdText: 'Node.js, TypeScript, SQL',
+      skillsExtracted: ['Node.js', 'TypeScript'],
+      status: 'Published',
+      createdAt: new Date().toISOString(),
+      orgName: 'Kreo Software',
+      questions: []
+    },
+    {
+      id: 'asmt-org-b',
+      title: 'Other Org Role',
+      roleLevel: 'Mid-Level',
+      experienceRequired: '3 Years',
+      jdText: 'Python',
+      skillsExtracted: ['Python'],
+      status: 'Published',
+      createdAt: new Date().toISOString(),
+      orgName: 'Other Corp',
+      questions: []
+    }
+  ],
+  candidates: [
+    {
+      id: 'cand-active-1',
+      name: 'Active Candidate',
+      email: 'active@example.com',
+      phone: '9999999999',
+      assessmentId: 'asmt-org-a',
+      status: 'In Progress',
+      token: 'tok-active-1',
+      orgName: 'Kreo Software',
+      feedbackReport: {
+        decision: 'Hire',
+        summary: 'Strong backend skills',
+        technicalScore: 85,
+        communicationScore: 80,
+        problemSolvingScore: 82,
+        cheatingRisk: 'Low',
+        cheatingLogs: [],
+        transcripts: [
+          {
+            questionId: 'q1',
+            category: 'tech',
+            questionText: 'Explain event loop',
+            candidateAnswer: 'Detailed secret verbatim answer',
+            aiEvaluation: 'Strong',
+            score: 88
+          }
+        ]
+      }
+    },
+    {
+      id: 'cand-completed-1',
+      name: 'Completed Candidate',
+      email: 'done@example.com',
+      phone: '8888888888',
+      assessmentId: 'asmt-org-a',
+      status: 'Completed',
+      token: 'tok-completed-1',
+      orgName: 'Kreo Software'
+    }
+  ],
+  questionBank: [
+    {
+      id: 'qb-1',
+      skill: 'Node.js',
+      difficulty: 'Moderate',
+      category: 'Technical',
+      question: 'Explain how streams work in Node.js and backpressure handling.',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      version: 1,
+      revisions: []
+    }
+  ]
+};
+
+before(async () => {
+  fs.writeFileSync(tempDbPath, JSON.stringify(seededDb, null, 2), 'utf-8');
+  resetDbCacheForTests();
+
+  const app = createApp();
+  await new Promise<void>((resolve) => {
+    server = app.listen(0, '127.0.0.1', () => {
+      const addr = server.address();
+      if (addr && typeof addr === 'object') {
+        baseUrl = `http://127.0.0.1:${addr.port}`;
+      }
+      resolve();
+    });
+  });
+
+  // Obtain verified session tokens for each persona
+  const login = async (email: string, password: string) => {
+    const res = await fetch(`${baseUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password })
+    });
+    assert.equal(res.status, 200);
+    const data = await res.json();
+    return data.token as string;
+  };
+
+  adminToken = await login('saurabh.dey@irissoftware.com', 'AdminPass!123');
+  recruiterToken = await login('recruiter@irissoftware.com', 'RecPass!123');
+  otherOrgToken = await login('lead@othercorp.com', 'OtherPass!123');
+});
+
+after(async () => {
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('1. Unauthenticated requests are denied (401) and public DB dump routes return 404', async () => {
+  for (const endpoint of ['/api/candidates', '/api/assessments', '/api/auth/users', '/api/question-bank/skills']) {
+    const res = await fetch(`${baseUrl}${endpoint}`);
+    assert.equal(res.status, 401, `${endpoint} should require authentication`);
+  }
+
+  for (const removed of ['/api/db', '/api/db-state', '/api/db-sync']) {
+    const res = await fetch(`${baseUrl}${removed}`);
+    assert.equal(res.status, 404, `${removed} should be permanently removed`);
+  }
+});
+
+test('2. Role isolation: Recruiter cannot escalate via forged x-user-role header or call Admin endpoints', async () => {
+  const headers = {
+    Authorization: `Bearer ${recruiterToken}`,
+    'x-user-role': 'Admin',
+    'Content-Type': 'application/json'
+  };
+
+  const usersRes = await fetch(`${baseUrl}/api/auth/users`, { headers });
+  assert.equal(usersRes.status, 403);
+
+  const registerRes = await fetch(`${baseUrl}/api/auth/register`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ name: 'Rogue', email: 'rogue@irissoftware.com', password: 'Password123', role: 'Admin' })
+  });
+  assert.equal(registerRes.status, 403);
+
+  const delAsmtRes = await fetch(`${baseUrl}/api/assessments/asmt-org-a`, {
+    method: 'DELETE',
+    headers
+  });
+  assert.equal(delAsmtRes.status, 403);
+
+  const delQbRes = await fetch(`${baseUrl}/api/question-bank/questions/qb-1`, {
+    method: 'DELETE',
+    headers
+  });
+  assert.equal(delQbRes.status, 403);
+});
+
+test('3. Organization isolation and candidate list transcript projection vs full detail', async () => {
+  // Other org cannot see Kreo Software candidates or assessments
+  const otherCandsRes = await fetch(`${baseUrl}/api/candidates`, {
+    headers: { Authorization: `Bearer ${otherOrgToken}` }
+  });
+  assert.equal(otherCandsRes.status, 200);
+  const otherCands = await otherCandsRes.json();
+  assert.equal(otherCands.length, 0);
+
+  const otherDetailRes = await fetch(`${baseUrl}/api/candidates/cand-active-1`, {
+    headers: { Authorization: `Bearer ${otherOrgToken}` }
+  });
+  assert.equal(otherDetailRes.status, 404);
+
+  // Kreo Software list endpoint omits verbatim transcripts
+  const listRes = await fetch(`${baseUrl}/api/candidates`, {
+    headers: { Authorization: `Bearer ${recruiterToken}` }
+  });
+  assert.equal(listRes.status, 200);
+  const list = await listRes.json();
+  const activeSummary = list.find((c: any) => c.id === 'cand-active-1');
+  assert.ok(activeSummary);
+  assert.deepEqual(activeSummary.feedbackReport.transcripts, []);
+
+  // Detail endpoint returns full transcripts
+  const detailRes = await fetch(`${baseUrl}/api/candidates/cand-active-1`, {
+    headers: { Authorization: `Bearer ${recruiterToken}` }
+  });
+  assert.equal(detailRes.status, 200);
+  const detail = await detailRes.json();
+  assert.equal(detail.feedbackReport.transcripts.length, 1);
+  assert.equal(detail.feedbackReport.transcripts[0].candidateAnswer, 'Detailed secret verbatim answer');
+});
+
+test('4. Authenticated bcrypt change-password rejects wrong password and succeeds with valid password', async () => {
+  const wrongRes = await fetch(`${baseUrl}/api/auth/change-password`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${recruiterToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ oldPassword: 'WrongPassword', newPassword: 'NewPassword!123' })
+  });
+  assert.equal(wrongRes.status, 401);
+
+  const okRes = await fetch(`${baseUrl}/api/auth/change-password`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${recruiterToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ oldPassword: 'RecPass!123', newPassword: 'NewPassword!123' })
+  });
+  assert.equal(okRes.status, 200);
+
+  // Confirm login works with new password
+  const relogin = await fetch(`${baseUrl}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: 'recruiter@irissoftware.com', password: 'NewPassword!123' })
+  });
+  assert.equal(relogin.status, 200);
+});
+
+test('5. Assessment schema validation, allowed status transitions, and auditHistory tracking', async () => {
+  const headers = {
+    Authorization: `Bearer ${adminToken}`,
+    'Content-Type': 'application/json'
+  };
+
+  // Invalid status rejected
+  const invalidStatus = await fetch(`${baseUrl}/api/assessments/asmt-org-a`, {
+    method: 'PUT',
+    headers,
+    body: JSON.stringify({ status: 'InvalidState' })
+  });
+  assert.equal(invalidStatus.status, 400);
+
+  // Move Published -> Closed (allowed)
+  const closeRes = await fetch(`${baseUrl}/api/assessments/asmt-org-a`, {
+    method: 'PUT',
+    headers,
+    body: JSON.stringify({ status: 'Closed' })
+  });
+  assert.equal(closeRes.status, 200);
+  const closedAsmt = await closeRes.json();
+  assert.equal(closedAsmt.status, 'Closed');
+  assert.equal(closedAsmt.updatedByEmail, 'saurabh.dey@irissoftware.com');
+  assert.ok(Array.isArray(closedAsmt.auditHistory) && closedAsmt.auditHistory.length >= 1);
+
+  // Move Closed -> Draft (forbidden state transition)
+  const badTransition = await fetch(`${baseUrl}/api/assessments/asmt-org-a`, {
+    method: 'PUT',
+    headers,
+    body: JSON.stringify({ status: 'Draft' })
+  });
+  assert.equal(badTransition.status, 400);
+
+  // Reopen Closed -> Published (allowed) so active candidate tests work
+  const reopenRes = await fetch(`${baseUrl}/api/assessments/asmt-org-a`, {
+    method: 'PUT',
+    headers,
+    body: JSON.stringify({ status: 'Published' })
+  });
+  assert.equal(reopenRes.status, 200);
+});
+
+test('6. Question bank validation and revision versioning on updates', async () => {
+  const headers = {
+    Authorization: `Bearer ${adminToken}`,
+    'Content-Type': 'application/json'
+  };
+
+  const badCreate = await fetch(`${baseUrl}/api/question-bank/questions`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ skill: 'Go', question: 'Hi' }) // too short
+  });
+  assert.equal(badCreate.status, 400);
+
+  const editRes = await fetch(`${baseUrl}/api/question-bank/questions/qb-1`, {
+    method: 'PUT',
+    headers,
+    body: JSON.stringify({
+      question: 'Explain Node.js Readable/Writable streams and how highWaterMark prevents memory spikes.'
+    })
+  });
+  assert.equal(editRes.status, 200);
+  const edited = await editRes.json();
+  assert.equal(edited.question.version, 2);
+  assert.equal(edited.question.revisions.length, 1);
+  assert.equal(edited.question.revisions[0].editedByEmail, 'saurabh.dey@irissoftware.com');
+});
+
+test('7. Code execution route enforces token/session authorization, size cap, and language allowlist', async () => {
+  // Invalid token rejected
+  const invalidTokenRes = await fetch(`${baseUrl}/api/interview/fake-token/execute-code`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code: 'console.log(1);', language: 'javascript' })
+  });
+  assert.equal(invalidTokenRes.status, 401);
+
+  // Unauthenticated demo token rejected
+  const unauthDemoRes = await fetch(`${baseUrl}/api/interview/demo/execute-code`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code: 'console.log(1);', language: 'javascript' })
+  });
+  assert.equal(unauthDemoRes.status, 401);
+
+  // Completed candidate token rejected
+  const completedRes = await fetch(`${baseUrl}/api/interview/tok-completed-1/execute-code`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code: 'console.log(1);', language: 'javascript' })
+  });
+  assert.equal(completedRes.status, 403);
+
+  // Oversized code (>20 KB) rejected with 413
+  const bigCode = 'a'.repeat(21_000);
+  const bigRes = await fetch(`${baseUrl}/api/interview/tok-active-1/execute-code`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code: bigCode, language: 'javascript' })
+  });
+  assert.equal(bigRes.status, 413);
+
+  // Unsupported language rejected with 400
+  const badLangRes = await fetch(`${baseUrl}/api/interview/tok-active-1/execute-code`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code: 'print(1)', language: 'cobol-99' })
+  });
+  assert.equal(badLangRes.status, 400);
+});
+
+test('8. Operations safety rails: security headers, restricted CORS, and 2 MB default body limit', async () => {
+  const healthRes = await fetch(`${baseUrl}/api/health`);
+  assert.equal(healthRes.status, 200);
+  assert.equal(healthRes.headers.get('x-content-type-options'), 'nosniff');
+  assert.equal(healthRes.headers.get('referrer-policy'), 'strict-origin-when-cross-origin');
+  assert.equal(healthRes.headers.get('x-powered-by'), null);
+
+  // Unauthorized cross-origin request rejected with 403
+  const evilCorsRes = await fetch(`${baseUrl}/api/health`, {
+    headers: { Origin: 'https://evil-attacker.example' }
+  });
+  assert.equal(evilCorsRes.status, 403);
+
+  // Default 2 MB JSON limit enforced on standard API routes
+  const hugePayload = JSON.stringify({ title: 'X', jdText: 'x'.repeat(2_200_000) });
+  const largeRes = await fetch(`${baseUrl}/api/assessments`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${adminToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: hugePayload
+  });
+  assert.equal(largeRes.status, 413);
+});

@@ -8,3 +8,4 @@ coverage/
 !.env.example
 db.json
 firebase-applet-config.json
+.session-secret

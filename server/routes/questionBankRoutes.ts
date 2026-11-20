@@ -13,8 +13,26 @@ import readline from 'readline';
 import zlib from 'zlib';
 import { getDb, saveDb } from '../db';
 import { QuestionBankItem } from '../types';
+import { requireAuth, requireRole, logAuditEvent } from '../authMiddleware';
 
 export const questionBankRouter = Router();
+
+// Require verified Recruiter/Admin session for question bank endpoints
+questionBankRouter.use(requireAuth);
+
+function validateQuestionPayload(body: any, isUpdate = false): string | null {
+  if (!isUpdate || body.skill !== undefined) {
+    if (typeof body.skill !== 'string' || !body.skill.trim() || body.skill.trim().length > 100) {
+      return 'Skill name is required and must be at most 100 characters.';
+    }
+  }
+  if (!isUpdate || body.question !== undefined) {
+    if (typeof body.question !== 'string' || body.question.trim().length < 5 || body.question.trim().length > 5000) {
+      return 'Question text must be between 5 and 5000 characters.';
+    }
+  }
+  return null;
+}
 
 // Helper: Normalize difficulty string
 function normalizeDifficulty(val: string): 'Easy' | 'Moderate' | 'Difficult' {
@@ -163,14 +181,15 @@ questionBankRouter.get('/questions', (req: Request, res: Response) => {
 
 /**
  * POST /api/question-bank/questions
- * Add single question manually
+ * Add single question manually (validated & audited)
  */
 questionBankRouter.post('/questions', (req: Request, res: Response) => {
   try {
     const { skill, skillCategory, subTopic, difficulty, category, question, sampleAnswer, evaluationRubric, starterCode, testCases } = req.body;
 
-    if (!skill || !skill.trim() || !question || !question.trim()) {
-      return res.status(400).json({ error: 'Skill name and Question text are required' });
+    const validationErr = validateQuestionPayload(req.body, false);
+    if (validationErr) {
+      return res.status(400).json({ error: validationErr });
     }
 
     const db = getDb();
@@ -183,25 +202,32 @@ questionBankRouter.post('/questions', (req: Request, res: Response) => {
       return res.status(409).json({ error: 'This question already exists for this skill in the bank' });
     }
 
+    const now = new Date().toISOString();
     const newItem: QuestionBankItem = {
       id: `qbank-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
       skill: skill.trim(),
-      skillCategory: skillCategory ? skillCategory.trim() : 'Development',
-      subTopic: subTopic ? subTopic.trim() : undefined,
+      skillCategory: skillCategory ? String(skillCategory).trim() : 'Development',
+      subTopic: subTopic ? String(subTopic).trim() : undefined,
       difficulty: normalizeDifficulty(difficulty),
       category: normalizeCategory(category),
       question: question.trim(),
-      sampleAnswer: sampleAnswer ? sampleAnswer.trim() : undefined,
-      evaluationRubric: evaluationRubric ? evaluationRubric.trim() : undefined,
-      starterCode: starterCode ? starterCode.trim() : undefined,
+      sampleAnswer: sampleAnswer ? String(sampleAnswer).trim() : undefined,
+      evaluationRubric: evaluationRubric ? String(evaluationRubric).trim() : undefined,
+      starterCode: starterCode ? String(starterCode).trim() : undefined,
       testCases: Array.isArray(testCases) ? testCases : undefined,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
+      createdAt: now,
+      updatedAt: now,
+      createdByEmail: req.authUser!.email,
+      updatedByEmail: req.authUser!.email,
+      version: 1,
+      revisions: [],
       source: 'manual'
     };
 
     db.questionBank.unshift(newItem);
     saveDb(db, true);
+
+    logAuditEvent('QBANK_CREATE', req.authUser!, { questionId: newItem.id, skill: newItem.skill });
 
     res.status(201).json({
       success: true,
@@ -216,11 +242,16 @@ questionBankRouter.post('/questions', (req: Request, res: Response) => {
 
 /**
  * PUT /api/question-bank/questions/:id
- * Update question item
+ * Update question item with automatic revision history versioning
  */
 questionBankRouter.put('/questions/:id', (req: Request, res: Response) => {
   try {
     const { id } = req.params;
+    const validationErr = validateQuestionPayload(req.body, true);
+    if (validationErr) {
+      return res.status(400).json({ error: validationErr });
+    }
+
     const db = getDb();
     if (!db.questionBank) db.questionBank = [];
 
@@ -230,6 +261,25 @@ questionBankRouter.put('/questions/:id', (req: Request, res: Response) => {
     }
 
     const existing = db.questionBank[index];
+    const now = new Date().toISOString();
+    const prevVersion = existing.version || 1;
+    const existingRevisions = Array.isArray(existing.revisions) ? existing.revisions : [];
+
+    // Snapshot previous state before applying edits
+    const nextRevisions = [
+      ...existingRevisions,
+      {
+        version: prevVersion,
+        question: existing.question,
+        difficulty: existing.difficulty,
+        category: existing.category,
+        sampleAnswer: existing.sampleAnswer,
+        evaluationRubric: existing.evaluationRubric,
+        editedByEmail: req.authUser!.email,
+        editedAt: now
+      }
+    ].slice(-20);
+
     const updated: QuestionBankItem = {
       ...existing,
       skill: req.body.skill ? req.body.skill.trim() : existing.skill,
@@ -242,12 +292,16 @@ questionBankRouter.put('/questions/:id', (req: Request, res: Response) => {
       evaluationRubric: req.body.evaluationRubric !== undefined ? req.body.evaluationRubric : existing.evaluationRubric,
       starterCode: req.body.starterCode !== undefined ? req.body.starterCode : existing.starterCode,
       testCases: req.body.testCases !== undefined ? req.body.testCases : existing.testCases,
-      updatedAt: new Date().toISOString()
+      updatedAt: now,
+      updatedByEmail: req.authUser!.email,
+      version: prevVersion + 1,
+      revisions: nextRevisions
     };
 
     db.questionBank[index] = updated;
     saveDb(db, true);
 
+    logAuditEvent('QBANK_UPDATE', req.authUser!, { questionId: id, version: updated.version });
     res.json({ success: true, question: updated });
   } catch (err) {
     console.error('[QUESTION BANK] Error updating question:', err);
@@ -257,9 +311,9 @@ questionBankRouter.put('/questions/:id', (req: Request, res: Response) => {
 
 /**
  * DELETE /api/question-bank/questions/:id
- * Delete question item
+ * Admin ONLY: Delete question item
  */
-questionBankRouter.delete('/questions/:id', (req: Request, res: Response) => {
+questionBankRouter.delete('/questions/:id', requireRole('Admin'), (req: Request, res: Response) => {
   try {
     const { id } = req.params;
     const db = getDb();
@@ -273,6 +327,7 @@ questionBankRouter.delete('/questions/:id', (req: Request, res: Response) => {
     }
 
     saveDb(db, true);
+    logAuditEvent('QBANK_DELETE', req.authUser!, { questionId: id });
     res.json({ success: true, remainingTotal: db.questionBank.length });
   } catch (err) {
     console.error('[QUESTION BANK] Error deleting question:', err);
@@ -282,9 +337,9 @@ questionBankRouter.delete('/questions/:id', (req: Request, res: Response) => {
 
 /**
  * POST /api/question-bank/import-default
- * Extract and parse the attached default ZIP archive (`interview_assessment_bank_v2_complete_89662387.zip`)
+ * Admin ONLY: Extract and parse the default ZIP archive
  */
-questionBankRouter.post('/import-default', async (req: Request, res: Response) => {
+questionBankRouter.post('/import-default', requireRole('Admin'), async (req: Request, res: Response) => {
   try {
     const zipRelativePath = 'public/assets/aistudio/interview_assessment_bank_v2_complete_89662387.zip';
     const zipFullPath = path.join(process.cwd(), zipRelativePath);

@@ -1,13 +1,13 @@
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
- * 
+ *
  * Enterprise High-Fidelity Text-to-Speech Streaming Synthesis Engine.
  * Powered by Edge Neural TTS & Gemini Neural Speech with In-Memory Low-Latency Cache.
  */
 
+import { GoogleGenAI } from '@google/genai';
 import { MsEdgeTTS, OUTPUT_FORMAT } from 'msedge-tts';
-import { getGeminiClient } from './gemini';
 
 export interface TTSResult {
   buffer: Buffer;
@@ -19,9 +19,41 @@ const ttsMemoryCache = new Map<string, TTSResult>();
 const MAX_CACHE_ENTRIES = 250;
 
 /**
+ * Shared LRU cache helper used across all TTS providers.
+ */
+function setCachedTts(cacheKey: string, result: TTSResult): TTSResult {
+  if (ttsMemoryCache.size >= MAX_CACHE_ENTRIES) {
+    const oldestKey = ttsMemoryCache.keys().next().value;
+    if (oldestKey) {
+      ttsMemoryCache.delete(oldestKey);
+    }
+  }
+  ttsMemoryCache.set(cacheKey, result);
+  return result;
+}
+
+/**
+ * Dedicated Gemini TTS client using v1beta API version (required for speechConfig & speechMetadata).
+ */
+function getGeminiTtsClient(): GoogleGenAI | null {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY' || apiKey.includes('YOUR_')) {
+    return null;
+  }
+  return new GoogleGenAI({
+    apiKey,
+    apiVersion: 'v1beta',
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build'
+      }
+    }
+  });
+}
+
+/**
  * Microsoft Edge High-Fidelity Neural Speech Synthesizer.
- * Uses Microsoft Azure's Neural TTS voice ('en-US-AvaMultilingualNeural' / 'en-US-AriaNeural').
- * Zero rate-limit caps, high latency efficiency, natural human diction.
+ * Uses Microsoft Azure's Neural TTS voice ('en-US-AvaMultilingualNeural').
  */
 async function synthesizeEdgeTTSAudio(cleanText: string, maxRetries = 1): Promise<Buffer | null> {
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -43,9 +75,10 @@ async function synthesizeEdgeTTSAudio(cleanText: string, maxRetries = 1): Promis
           const fullBuffer = Buffer.concat(chunks);
           resolve(fullBuffer.length > 0 ? fullBuffer : null);
         });
-        stream.audioStream.on('error', (err: any) => {
+        stream.audioStream.on('error', (err: unknown) => {
           clearTimeout(timeout);
-          console.warn(`[EDGE TTS] Stream error on attempt ${attempt + 1}:`, err?.message || err);
+          const msg = err instanceof Error ? err.message : String(err);
+          console.warn(`[EDGE TTS] Stream error on attempt ${attempt + 1}:`, msg);
           resolve(null);
         });
       });
@@ -53,15 +86,16 @@ async function synthesizeEdgeTTSAudio(cleanText: string, maxRetries = 1): Promis
       if (result && result.length > 0) {
         return result;
       }
-    } catch (err: any) {
-      console.warn(`[EDGE TTS] Synthesis failure on attempt ${attempt + 1}:`, err?.message || err);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[EDGE TTS] Synthesis failure on attempt ${attempt + 1}:`, msg);
     }
   }
   return null;
 }
 
 /**
- * Fallback chunked translation synthesizer for offline or network-constrained scenarios.
+ * Fallback chunked translation synthesizer for network-constrained scenarios.
  */
 async function synthesizeFallbackAudio(cleanText: string): Promise<Buffer | null> {
   const maxLen = 180;
@@ -80,7 +114,7 @@ async function synthesizeFallbackAudio(cleanText: string): Promise<Buffer | null
       let currentPart = '';
       for (const part of subParts) {
         if ((currentPart + ' ' + part).length <= maxLen) {
-          currentPart = currentPart ? currentPart + ' ' + part : part;
+          currentPart = currentPart ? `${currentPart} ${part}` : part;
         } else {
           if (currentPart) chunks.push(currentPart);
           if (part.length <= maxLen) {
@@ -90,7 +124,7 @@ async function synthesizeFallbackAudio(cleanText: string): Promise<Buffer | null
             let forcedPart = '';
             for (const word of words) {
               if ((forcedPart + ' ' + word).length <= maxLen) {
-                forcedPart = forcedPart ? forcedPart + ' ' + word : word;
+                forcedPart = forcedPart ? `${forcedPart} ${word}` : word;
               } else {
                 if (forcedPart) chunks.push(forcedPart);
                 forcedPart = word;
@@ -106,7 +140,7 @@ async function synthesizeFallbackAudio(cleanText: string): Promise<Buffer | null
     }
   }
 
-  const filteredChunks = chunks.filter(c => c.trim().length > 0);
+  const filteredChunks = chunks.filter((c) => c.trim().length > 0);
   if (filteredChunks.length === 0) {
     return null;
   }
@@ -124,16 +158,16 @@ async function synthesizeFallbackAudio(cleanText: string): Promise<Buffer | null
         return { idx, buffer: Buffer.from(arrayBuffer) };
       }
     } catch (err) {
-      console.warn(`[TTS FALLBACK] Request fail for segment ${idx}: "${chunk}"`, err);
+      console.warn(`[TTS FALLBACK] Request fail for segment ${idx}:`, err instanceof Error ? err.message : err);
     }
     return { idx, buffer: null };
   });
 
   const results = await Promise.all(fetchPromises);
   const validBuffers = results
-    .filter(r => r.buffer !== null)
+    .filter((r): r is { idx: number; buffer: Buffer } => r.buffer !== null)
     .sort((a, b) => a.idx - b.idx)
-    .map(r => r.buffer as Buffer);
+    .map((r) => r.buffer);
 
   if (validBuffers.length === 0) {
     return null;
@@ -142,92 +176,92 @@ async function synthesizeFallbackAudio(cleanText: string): Promise<Buffer | null
   return Buffer.concat(validBuffers);
 }
 
-// Concurrency serializer and rate-limit circuit breaker for Gemini TTS
-let activeGeminiPromise: Promise<any> = Promise.resolve();
+// Concurrency serializer and cooldown circuit breaker for Gemini TTS
+let activeGeminiPromise: Promise<unknown> = Promise.resolve();
 let geminiRateLimitCooldownUntil = 0;
 
 function serializeGeminiCall<T>(task: () => Promise<T>): Promise<T> {
   const current = activeGeminiPromise.then(task, task);
-  activeGeminiPromise = current.catch(() => {});
+  activeGeminiPromise = current.catch(() => undefined);
   return current;
 }
 
 /**
  * Synthesizes speech with natural human cadence, deliberate interviewer pacing, and 0ms cache.
- * Uses Microsoft Edge Neural TTS as primary resilient engine, backed by Gemini Neural TTS and chunked fallback.
+ * Uses Microsoft Edge Neural TTS as primary engine, backed by Gemini Neural TTS (v1beta) and chunked fallback.
  */
 export async function synthesizeSpeech(text: string): Promise<TTSResult | null> {
   const cleanText = text.replace(/\s+/g, ' ').trim();
   if (!cleanText) return null;
 
-  // 1. Return cached audio immediately (0ms delay for preloaded questions)
-  if (ttsMemoryCache.has(cleanText)) {
-    return ttsMemoryCache.get(cleanText)!;
+  // 1. Return cached audio immediately
+  const cached = ttsMemoryCache.get(cleanText);
+  if (cached) {
+    return cached;
   }
 
-  // 2. High-Fidelity Edge Neural TTS Engine (Unconstrained, zero daily quota limit, studio quality)
+  // 2. Primary: Edge Neural TTS
   try {
     const edgeBuffer = await synthesizeEdgeTTSAudio(cleanText);
     if (edgeBuffer && edgeBuffer.length > 0) {
-      const result: TTSResult = { buffer: edgeBuffer, mimeType: 'audio/mpeg' };
-      if (ttsMemoryCache.size >= MAX_CACHE_ENTRIES) {
-        const oldestKey = ttsMemoryCache.keys().next().value;
-        if (oldestKey) ttsMemoryCache.delete(oldestKey);
-      }
-      ttsMemoryCache.set(cleanText, result);
-      return result;
+      return setCachedTts(cleanText, { buffer: edgeBuffer, mimeType: 'audio/mpeg' });
     }
   } catch (edgeErr) {
     console.warn('[EDGE TTS] Bypassing to secondary speech engine:', edgeErr);
   }
 
-  // 3. Gemini 3.8 Flash Lite TTS Engine (Serialized with rate-limit circuit breaker)
+  // 3. Secondary: Gemini 3.8 Flash Lite TTS (v1beta required for speechConfig/speechMetadata)
   const isCooldownActive = Date.now() < geminiRateLimitCooldownUntil;
-  const ai = getGeminiClient();
+  const ai = getGeminiTtsClient();
 
   if (ai && !isCooldownActive) {
     try {
       const result = await serializeGeminiCall(async () => {
-        if (ttsMemoryCache.has(cleanText)) {
-          return ttsMemoryCache.get(cleanText)!;
-        }
+        const alreadyCached = ttsMemoryCache.get(cleanText);
+        if (alreadyCached) return alreadyCached;
 
-        const response = await ai.models.generateContent({
-          model: 'gemini-3.8-flash-lite-tts',
-          contents: [
-            {
-              role: 'user',
-              parts: [
-                {
-                  text: cleanText,
-                  speechMetadata: {
-                    style: 'Natural, warm, human interviewer speaking at a slow, calm, and deliberate pace. Use gentle unhurried conversational cadence, thoughtful natural pauses, empathetic human inflection, and clear professional diction without sounding robotic, rushed, or synthetic.',
-                  },
-                } as any,
-              ],
-            } as any,
-          ],
-          config: {
-            responseModalities: ['AUDIO'],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: { voiceName: 'Aoede' },
-              },
-            },
-          },
+        let timerId: NodeJS.Timeout | undefined;
+        const timeoutPromise = new Promise<never>((_, reject) => {
+          timerId = setTimeout(() => reject(new Error('Gemini TTS timeout (10s)')), 10000);
         });
 
-        const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+        let response: any;
+        try {
+          response = await Promise.race([
+            ai.models.generateContent({
+              model: 'gemini-3.8-flash-lite-tts',
+              contents: [
+                {
+                  role: 'user',
+                  parts: [
+                    {
+                      text: cleanText,
+                      speechMetadata: {
+                        style: 'Natural, warm, human interviewer speaking at a slow, calm, and deliberate pace. Use gentle unhurried conversational cadence, thoughtful natural pauses, empathetic human inflection, and clear professional diction without sounding robotic, rushed, or synthetic.'
+                      }
+                    } as any
+                  ]
+                }
+              ],
+              config: {
+                responseModalities: ['AUDIO'],
+                speechConfig: {
+                  voiceConfig: {
+                    prebuiltVoiceConfig: { voiceName: 'Kore' }
+                  }
+                }
+              }
+            }),
+            timeoutPromise
+          ]);
+        } finally {
+          if (timerId) clearTimeout(timerId);
+        }
+
+        const base64Audio = response?.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
         if (base64Audio) {
           const buffer = Buffer.from(base64Audio, 'base64');
-          const ttsRes: TTSResult = { buffer, mimeType: 'audio/wav' };
-
-          if (ttsMemoryCache.size >= MAX_CACHE_ENTRIES) {
-            const oldestKey = ttsMemoryCache.keys().next().value;
-            if (oldestKey) ttsMemoryCache.delete(oldestKey);
-          }
-          ttsMemoryCache.set(cleanText, ttsRes);
-          return ttsRes;
+          return setCachedTts(cleanText, { buffer, mimeType: 'audio/wav' });
         }
         return null;
       });
@@ -238,25 +272,30 @@ export async function synthesizeSpeech(text: string): Promise<TTSResult | null> 
     } catch (err: any) {
       const errMsg = err?.message || String(err);
       const isRateLimit = err?.status === 429 || errMsg.includes('429') || errMsg.includes('RESOURCE_EXHAUSTED') || errMsg.includes('quota');
-      
+      const isUnavailableOrInvalid =
+        err?.status === 404 ||
+        err?.status === 400 ||
+        errMsg.includes('404') ||
+        errMsg.includes('NOT_FOUND') ||
+        errMsg.includes('INVALID_ARGUMENT');
+
       if (isRateLimit) {
         geminiRateLimitCooldownUntil = Date.now() + 12 * 3600 * 1000;
-        console.warn(`[GEMINI TTS RATE-LIMIT] 429 detected. Setting 12h persistent cooldown.`);
+        console.warn('[GEMINI TTS RATE-LIMIT] 429 detected. Setting 12h cooldown.');
+      } else if (isUnavailableOrInvalid) {
+        geminiRateLimitCooldownUntil = Date.now() + 10 * 60 * 1000;
+        console.warn(`[GEMINI TTS] Model/payload rejected (${errMsg}). Setting 10m cooldown.`);
+      } else {
+        console.warn('[GEMINI TTS] Error:', errMsg);
       }
     }
   }
 
-  // 4. Multi-chunk translation fallback synthesizer (Zero quota restriction)
+  // 4. Tertiary: Multi-chunk fallback synthesizer
   try {
     const fallbackBuffer = await synthesizeFallbackAudio(cleanText);
     if (fallbackBuffer) {
-      const result: TTSResult = { buffer: fallbackBuffer, mimeType: 'audio/mpeg' };
-      if (ttsMemoryCache.size >= MAX_CACHE_ENTRIES) {
-        const oldestKey = ttsMemoryCache.keys().next().value;
-        if (oldestKey) ttsMemoryCache.delete(oldestKey);
-      }
-      ttsMemoryCache.set(cleanText, result);
-      return result;
+      return setCachedTts(cleanText, { buffer: fallbackBuffer, mimeType: 'audio/mpeg' });
     }
   } catch (fallbackErr) {
     console.error('[TTS FATAL] Fallback synthesis failed:', fallbackErr);

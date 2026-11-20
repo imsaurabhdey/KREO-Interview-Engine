@@ -22,6 +22,19 @@ export interface QuestionBankItem {
   testCases?: Array<{ input: string; output: string }>;
   createdAt: string;
   updatedAt: string;
+  createdByEmail?: string;
+  updatedByEmail?: string;
+  version?: number;
+  revisions?: Array<{
+    version: number;
+    question: string;
+    difficulty: string;
+    category: string;
+    sampleAnswer?: string;
+    evaluationRubric?: string;
+    editedByEmail: string;
+    editedAt: string;
+  }>;
   source?: 'default_bank' | 'manual' | 'bulk_import';
   embedding?: number[];
 }
@@ -57,6 +70,17 @@ export interface Assessment {
   locations?: string[];
   createdByEmail?: string;
   createdByName?: string;
+  updatedAt?: string;
+  updatedByEmail?: string;
+  updatedByName?: string;
+  orgName?: string;
+  auditHistory?: Array<{
+    action: string;
+    actorEmail: string;
+    actorName: string;
+    timestamp: string;
+    summary?: string;
+  }>;
   roundsEnabled?: {
     tech: boolean;
     coding: boolean;
@@ -89,6 +113,14 @@ export interface TranscriptEntry {
   crossAiEvaluation?: string;
 }
 
+export interface EvaluationHistoryEntry {
+  stage: 'baseline_submitted' | 'ai_retrospective' | 'baseline_fallback' | 'proctor_suspension';
+  decision: 'Strong Hire' | 'Hire' | 'Neutral' | 'Reject' | 'Review Pending';
+  overallScore: number;
+  timestamp: string;
+  note: string;
+}
+
 export interface EvaluationReport {
   decision: 'Strong Hire' | 'Hire' | 'Neutral' | 'Reject' | 'Review Pending';
   summary: string;
@@ -100,6 +132,9 @@ export interface EvaluationReport {
   transcripts: TranscriptEntry[];
   pros?: string[];
   cons?: string[];
+  evaluationStatus?: 'in_progress' | 'pending_ai' | 'completed_ai' | 'completed_baseline' | 'suspended';
+  evaluationSource?: 'ai_retrospective' | 'baseline_heuristic' | 'proctor_suspension';
+  evaluationHistory?: EvaluationHistoryEntry[];
 }
 
 export interface Candidate {
@@ -121,6 +156,7 @@ export interface Candidate {
   createdAt?: string;
   createdByEmail?: string;
   createdByName?: string;
+  orgName?: string;
   recordingUrl?: string;
   recordingDuration?: number;
   selectionStatus?: 'Selected' | 'Not Selected' | 'Processing';

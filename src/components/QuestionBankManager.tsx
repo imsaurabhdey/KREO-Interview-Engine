@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { QuestionBankItem } from '../types';
+import { apiFetch } from '../utils/authFetch';
 
 interface SkillTaxonomyGroup {
   skill: string;
@@ -74,7 +75,7 @@ export default function QuestionBankManager({ userEmail, notifyUser }: QuestionB
     setLoading(true);
     try {
       // 1. Fetch skill taxonomy summary
-      const skillsRes = await fetch('/api/question-bank/skills');
+      const skillsRes = await apiFetch('/api/question-bank/skills');
       if (skillsRes.ok) {
         const skillsData = await skillsRes.json();
         setSkills(skillsData.skills || []);
@@ -98,7 +99,7 @@ export default function QuestionBankManager({ userEmail, notifyUser }: QuestionB
       if (searchQuery.trim()) queryParams.set('search', searchQuery.trim());
       queryParams.set('limit', '10000'); // Fetch up to 10,000 matching questions for full visibility
 
-      const qRes = await fetch(`/api/question-bank/questions?${queryParams.toString()}`);
+      const qRes = await apiFetch(`/api/question-bank/questions?${queryParams.toString()}`);
       if (qRes.ok) {
         const qData = await qRes.json();
         setQuestions(qData.questions || []);
@@ -117,7 +118,7 @@ export default function QuestionBankManager({ userEmail, notifyUser }: QuestionB
     notifyUser('Extracting and parsing 1,000+ default questions from ZIP dataset...', 'success');
 
     try {
-      const res = await fetch('/api/question-bank/import-default', {
+      const res = await apiFetch('/api/question-bank/import-default', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' }
       });
@@ -185,13 +186,13 @@ export default function QuestionBankManager({ userEmail, notifyUser }: QuestionB
 
       let res;
       if (editingItem) {
-        res = await fetch(`/api/question-bank/questions/${editingItem.id}`, {
+        res = await apiFetch(`/api/question-bank/questions/${editingItem.id}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
       } else {
-        res = await fetch('/api/question-bank/questions', {
+        res = await apiFetch('/api/question-bank/questions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
@@ -219,7 +220,7 @@ export default function QuestionBankManager({ userEmail, notifyUser }: QuestionB
     }
 
     try {
-      const res = await fetch(`/api/question-bank/questions/${id}`, {
+      const res = await apiFetch(`/api/question-bank/questions/${id}`, {
         method: 'DELETE'
       });
 
@@ -227,7 +228,8 @@ export default function QuestionBankManager({ userEmail, notifyUser }: QuestionB
         notifyUser('Question deleted from bank.');
         await fetchTaxonomyAndQuestions();
       } else {
-        notifyUser('Failed to delete question item.', 'dev');
+        const errData = await res.json().catch(() => ({}));
+        notifyUser(errData.error || 'Failed to delete question item.', 'dev');
       }
     } catch (err) {
       console.error(err);
@@ -257,7 +259,7 @@ export default function QuestionBankManager({ userEmail, notifyUser }: QuestionB
         reader.readAsDataURL(uploadFile);
       });
 
-      const res = await fetch('/api/question-bank/upload', {
+      const res = await apiFetch('/api/question-bank/upload', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

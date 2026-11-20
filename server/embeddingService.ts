@@ -26,30 +26,71 @@ export function cosineSimilarity(vecA: number[], vecB: number[]): number {
   return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
 }
 
+// In-memory embedding cache and failure circuit breaker to prevent repeated slow calls
+const embeddingCache = new Map<string, number[]>();
+const MAX_EMBEDDING_CACHE = 1000;
+let embeddingCooldownUntil = 0;
+const EMBEDDING_TIMEOUT_MS = 5000;
+
 /**
- * Generates a vector embedding for input text using Google's gemini-embedding-001 model.
+ * Generates a vector embedding for input text using Google's gemini-embedding-2 model
+ * with fallback, caching, and timeout protection.
  */
 export async function getEmbedding(text: string): Promise<number[] | null> {
-  if (!text || text.trim().length === 0) return null;
+  const normalized = (text || '').trim();
+  if (!normalized) return null;
+
+  const cacheKey = normalized.toLowerCase();
+  if (embeddingCache.has(cacheKey)) {
+    return embeddingCache.get(cacheKey)!;
+  }
+
+  if (Date.now() < embeddingCooldownUntil) {
+    return null;
+  }
+
   const ai = getGeminiClient();
   if (!ai) return null;
 
-  try {
-    const response = await ai.models.embedContent({
-      model: 'gemini-embedding-001',
-      contents: text.trim().substring(0, 4000) // Truncate to safe token length
-    });
+  const modelsToTry = ['gemini-embedding-2', 'gemini-embedding-001'];
+  for (const model of modelsToTry) {
+    let timerId: NodeJS.Timeout | undefined;
+    try {
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timerId = setTimeout(() => reject(new Error(`Embedding timeout (${EMBEDDING_TIMEOUT_MS}ms)`)), EMBEDDING_TIMEOUT_MS);
+      });
 
-    if (response) {
-      if ((response as any).embeddings?.[0]?.values) {
-        return (response as any).embeddings[0].values;
+      const response = await Promise.race([
+        ai.models.embedContent({
+          model,
+          contents: normalized.substring(0, 4000)
+        }),
+        timeoutPromise
+      ]);
+
+      const values =
+        (response as any)?.embeddings?.[0]?.values ||
+        (response as any)?.embedding?.values ||
+        null;
+
+      if (values && Array.isArray(values) && values.length > 0) {
+        if (embeddingCache.size >= MAX_EMBEDDING_CACHE) {
+          const oldest = embeddingCache.keys().next().value;
+          if (oldest) embeddingCache.delete(oldest);
+        }
+        embeddingCache.set(cacheKey, values);
+        return values;
       }
-      if ((response as any).embedding?.values) {
-        return (response as any).embedding.values;
+    } catch (err: any) {
+      const msg = String(err?.message || err).toLowerCase();
+      console.warn(`[EMBEDDING SERVICE] Model "${model}" failed:`, err?.message || err);
+      if (msg.includes('429') || msg.includes('quota') || msg.includes('resource_exhausted') || msg.includes('api_key_invalid')) {
+        embeddingCooldownUntil = Date.now() + 60 * 1000;
+        break;
       }
+    } finally {
+      if (timerId) clearTimeout(timerId);
     }
-  } catch (err: any) {
-    console.warn('[EMBEDDING SERVICE] Error generating vector embedding:', err?.message || err);
   }
 
   return null;
