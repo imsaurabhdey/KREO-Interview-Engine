@@ -48,6 +48,16 @@ function constantTimeCodeMatch(expected: string, provided: string): boolean {
   return crypto.timingSafeEqual(a, b);
 }
 
+function validatePasswordStrength(password: string): string | null {
+  if (password.length < 8) {
+    return 'Password must be at least 8 characters long.';
+  }
+  if (!/[A-Z]/.test(password) || !/[a-z]/.test(password) || !/[0-9]/.test(password)) {
+    return 'Password must include at least one uppercase letter, one lowercase letter, and one number.';
+  }
+  return null;
+}
+
 function isPrimaryProtectedAdmin(email: string): boolean {
   const bootstrapEmail = (process.env.BOOTSTRAP_ADMIN_EMAIL || '').trim().toLowerCase();
   const normalized = email.toLowerCase().trim();
@@ -172,6 +182,11 @@ authRouter.post('/reset-password', authAttemptLimiter, (req, res) => {
     });
   }
 
+  const passwordError = validatePasswordStrength(String(newPassword));
+  if (passwordError) {
+    return res.status(400).json({ error: passwordError });
+  }
+
   const db = getDb();
   const matchedUserIndex = db.accounts.findIndex(
     (acc) => acc.email.toLowerCase().trim() === userEmail
@@ -201,8 +216,9 @@ authRouter.post('/change-password', requireAuth, (req, res) => {
     return res.status(400).json({ error: 'Current password and new password are required.' });
   }
 
-  if (String(newPassword).length < 6) {
-    return res.status(400).json({ error: 'New password must be at least 6 characters.' });
+  const passwordError = validatePasswordStrength(String(newPassword));
+  if (passwordError) {
+    return res.status(400).json({ error: passwordError });
   }
 
   const db = getDb();
@@ -234,8 +250,9 @@ authRouter.post('/register', requireAuth, requireRole('Admin'), (req, res) => {
     return res.status(400).json({ error: 'Name, email, and password are required.' });
   }
 
-  if (String(password).length < 6) {
-    return res.status(400).json({ error: 'Password must be at least 6 characters.' });
+  const passwordError = validatePasswordStrength(String(password));
+  if (passwordError) {
+    return res.status(400).json({ error: passwordError });
   }
 
   const validatedRole: UserRole = role === 'Admin' ? 'Admin' : 'Recruiter';

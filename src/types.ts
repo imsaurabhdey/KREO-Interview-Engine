@@ -139,6 +139,16 @@ export interface EvaluationReport {
   evaluationHistory?: EvaluationHistoryEntry[];
 }
 
+export type HumanReviewDecision = 'Shortlisted' | 'On Hold' | 'Rejected' | 'Hired';
+
+export interface HumanReview {
+  decision: HumanReviewDecision;
+  notes: string;
+  reviewedByEmail: string;
+  reviewedByName: string;
+  reviewedAt: string;
+}
+
 export interface Candidate {
   id: string;
   name: string;
@@ -164,4 +174,5 @@ export interface Candidate {
   selectionStatus?: 'Selected' | 'Not Selected' | 'Processing';
   tokenExpiresAt?: string;
   consentAcceptedAt?: string;
+  humanReview?: HumanReview;
 }

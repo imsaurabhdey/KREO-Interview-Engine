@@ -252,6 +252,98 @@ candidateRouter.put('/:id', (req, res) => {
   res.json({ success: true, candidate });
 });
 
+// Record human recruiter review decision & notes (Human-in-the-Loop governance)
+const ALLOWED_HUMAN_DECISIONS = new Set(['Shortlisted', 'On Hold', 'Rejected', 'Hired']);
+candidateRouter.put('/:id/human-review', (req, res) => {
+  const { id } = req.params;
+  const { decision, notes } = req.body || {};
+
+  if (!decision || !ALLOWED_HUMAN_DECISIONS.has(String(decision))) {
+    return res.status(400).json({
+      error: 'Valid decision is required (Shortlisted, On Hold, Rejected, or Hired).'
+    });
+  }
+
+  const cleanNotes = typeof notes === 'string' ? notes.trim().slice(0, 2000) : '';
+  const db = getDb();
+  const candidate = db.candidates.find((c) => c.id === id && canAccessOrg(req.authUser!, c.orgName));
+  if (!candidate) {
+    return res.status(404).json({ error: 'Candidate not found.' });
+  }
+
+  const typedDecision = decision as 'Shortlisted' | 'On Hold' | 'Rejected' | 'Hired';
+  candidate.humanReview = {
+    decision: typedDecision,
+    notes: cleanNotes,
+    reviewedByEmail: req.authUser!.email,
+    reviewedByName: req.authUser!.name,
+    reviewedAt: new Date().toISOString()
+  };
+
+  // Sync top-level selectionStatus with human recruiter decision
+  if (typedDecision === 'Shortlisted' || typedDecision === 'Hired') {
+    candidate.selectionStatus = 'Selected';
+  } else if (typedDecision === 'Rejected') {
+    candidate.selectionStatus = 'Not Selected';
+  } else {
+    candidate.selectionStatus = 'Processing';
+  }
+
+  saveDb(db, true);
+
+  logAuditEvent('CANDIDATE_HUMAN_REVIEW', req.authUser!, {
+    candidateId: candidate.id,
+    decision: typedDecision
+  });
+
+  res.json({ success: true, candidate });
+});
+
+// Rotate & extend invite link (+7 days default) for non-completed candidates
+candidateRouter.post('/:id/reissue-invite', (req, res) => {
+  const { id } = req.params;
+  const db = getDb();
+  const candidate = db.candidates.find((c) => c.id === id && canAccessOrg(req.authUser!, c.orgName));
+  if (!candidate) {
+    return res.status(404).json({ error: 'Candidate not found.' });
+  }
+
+  if (candidate.status === 'Completed' || candidate.status === 'Suspended') {
+    return res.status(409).json({
+      error: `Cannot re-issue invite link because this interview is already finalized (${candidate.status}).`
+    });
+  }
+
+  const tokenTtlDays = Math.max(1, Number(process.env.INVITE_TOKEN_TTL_DAYS || 7));
+  candidate.token = `tok-${crypto.randomBytes(16).toString('hex')}`;
+  candidate.tokenExpiresAt = new Date(Date.now() + tokenTtlDays * 24 * 60 * 60 * 1000).toISOString();
+  candidate.status = 'Candidate Invited';
+
+  saveDb(db, true);
+
+  const asmt = db.assessments.find((a) => a.id === candidate.assessmentId);
+  const startLink = `${process.env.APP_URL || 'http://localhost:3000'}/?token=${candidate.token}`;
+
+  if (req.body?.sendEmail !== false) {
+    sendCandidateEmail(candidate.email, candidate.name, 'INVITATION', {
+      assessmentTitle: asmt?.title,
+      startLink
+    }).catch((err) => console.error('Async re-issued invite email error:', err));
+  }
+
+  logAuditEvent('CANDIDATE_REISSUE_INVITE', req.authUser!, {
+    candidateId: candidate.id,
+    tokenExpiresAt: candidate.tokenExpiresAt
+  });
+
+  res.json({
+    success: true,
+    candidate,
+    startLink,
+    tokenExpiresAt: candidate.tokenExpiresAt
+  });
+});
+
 // Delete candidate & linked recordings
 candidateRouter.delete('/:id', async (req, res) => {
   const { id } = req.params;

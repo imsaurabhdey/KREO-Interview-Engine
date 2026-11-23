@@ -13,9 +13,11 @@ import {
   AlertCircle,
   ShieldAlert,
   Video,
-  Download
+  Download,
+  RefreshCw,
+  UserCheck
 } from 'lucide-react';
-import type { Assessment, Candidate } from '../../types';
+import type { Assessment, Candidate, HumanReviewDecision } from '../../types';
 import { apiFetch } from '../../utils/authFetch';
 
 interface CandidateReportPanelProps {
@@ -27,6 +29,7 @@ interface CandidateReportPanelProps {
   onReportTabChange: (tab: 'overview' | 'coding' | 'transcripts') => void;
   onForceCompileReport: () => void;
   onNotifyUser: (message: string, type?: 'success' | 'dev') => void;
+  onCandidateUpdated?: (updated: Candidate) => void;
 }
 
 export default function CandidateReportPanel({
@@ -37,12 +40,27 @@ export default function CandidateReportPanel({
   getExactUserName,
   onReportTabChange,
   onForceCompileReport,
-  onNotifyUser
+  onNotifyUser,
+  onCandidateUpdated
 }: CandidateReportPanelProps) {
   const [resolvedRecordingSrc, setResolvedRecordingSrc] = useState<string>('');
   const [recordingLoadError, setRecordingLoadError] = useState<string>('');
+  const [humanDecision, setHumanDecision] = useState<HumanReviewDecision>('Shortlisted');
+  const [humanNotes, setHumanNotes] = useState<string>('');
+  const [savingHumanReview, setSavingHumanReview] = useState<boolean>(false);
+  const [reissuingInvite, setReissuingInvite] = useState<boolean>(false);
 
   const rawRecordingUrl = selectedCandidate?.recordingUrl || demoRecordingUrl || '';
+
+  useEffect(() => {
+    if (selectedCandidate?.humanReview) {
+      setHumanDecision(selectedCandidate.humanReview.decision);
+      setHumanNotes(selectedCandidate.humanReview.notes || '');
+    } else {
+      setHumanDecision('Shortlisted');
+      setHumanNotes('');
+    }
+  }, [selectedCandidate?.id, selectedCandidate?.humanReview?.reviewedAt]);
 
   useEffect(() => {
     let active = true;
@@ -239,6 +257,66 @@ export default function CandidateReportPanel({
     onNotifyUser(`Downloaded Word (.doc) transcript report for ${selectedCandidate.name} successfully.`);
   };
 
+  const handleSaveHumanReview = async () => {
+    if (!selectedCandidate) return;
+    setSavingHumanReview(true);
+    try {
+      const res = await apiFetch(`/api/candidates/${selectedCandidate.id}/human-review`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          decision: humanDecision,
+          notes: humanNotes
+        })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.candidate) {
+        onCandidateUpdated?.(data.candidate);
+        onNotifyUser(`Saved human review decision (${humanDecision}) for ${selectedCandidate.name}.`);
+      } else {
+        onNotifyUser(data.error || 'Failed to save human review.', 'dev');
+      }
+    } catch (err) {
+      console.error('Human review save failed:', err);
+      onNotifyUser('Network error while saving human review.', 'dev');
+    } finally {
+      setSavingHumanReview(false);
+    }
+  };
+
+  const handleReissueInvite = async () => {
+    if (!selectedCandidate) return;
+    setReissuingInvite(true);
+    try {
+      const res = await apiFetch(`/api/candidates/${selectedCandidate.id}/reissue-invite`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sendEmail: true })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.candidate) {
+        onCandidateUpdated?.(data.candidate);
+        const freshUrl = `${window.location.origin}/?token=${data.candidate.token}`;
+        if (navigator.clipboard?.writeText) {
+          navigator.clipboard.writeText(freshUrl).catch(() => {});
+        }
+        onNotifyUser(`Fresh invite link issued (+7 days) & copied to clipboard for ${selectedCandidate.name}.`);
+      } else {
+        onNotifyUser(data.error || 'Could not re-issue invite link.', 'dev');
+      }
+    } catch (err) {
+      console.error('Re-issue invite failed:', err);
+      onNotifyUser('Network error while re-issuing invite link.', 'dev');
+    } finally {
+      setReissuingInvite(false);
+    }
+  };
+
+  const isFinalized = selectedCandidate.status === 'Completed' || selectedCandidate.status === 'Suspended';
+  const isTokenExpired = Boolean(
+    selectedCandidate.tokenExpiresAt && Date.now() > Date.parse(selectedCandidate.tokenExpiresAt)
+  );
+
   return (
     <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm space-y-6" id="candidate-detailed-report">
       {/* Candidate Scorecard Header */}
@@ -335,6 +413,32 @@ export default function CandidateReportPanel({
               System automated status based on candidate progress & <strong>75% Benchmark</strong>
             </span>
           </div>
+
+          {!isFinalized && (
+            <div className="mt-3 pt-3 border-t border-slate-100 flex flex-wrap items-center justify-between gap-2 text-xs">
+              <div className="text-[11px] text-slate-500">
+                Invite link status:{' '}
+                {isTokenExpired ? (
+                  <span className="font-semibold text-rose-600">Expired</span>
+                ) : selectedCandidate.tokenExpiresAt ? (
+                  <span className="font-medium text-slate-700">
+                    Active until {new Date(selectedCandidate.tokenExpiresAt).toLocaleDateString()}
+                  </span>
+                ) : (
+                  <span className="font-medium text-slate-700">Active</span>
+                )}
+              </div>
+              <button
+                type="button"
+                disabled={reissuingInvite}
+                onClick={handleReissueInvite}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 text-[11px] font-semibold transition-colors cursor-pointer disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${reissuingInvite ? 'animate-spin' : ''}`} />
+                {reissuingInvite ? 'Issuing New Link...' : 'Re-issue Invite Link (+7 Days)'}
+              </button>
+            </div>
+          )}
         </div>
       </div>
 
@@ -439,6 +543,72 @@ export default function CandidateReportPanel({
       {/* Subcategory Tab 1: Core Overview */}
       {reportActiveTab === 'overview' && (
         <div className="space-y-6" id="report-active-overview">
+          {/* Human Recruiter Decision & Governance Card */}
+          <div className="bg-slate-50 border border-indigo-200 rounded-xl p-4 space-y-3" id="human-review-panel">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h4 className="text-xs font-mono uppercase tracking-wider text-indigo-800 font-bold flex items-center gap-1.5">
+                <UserCheck className="w-4 h-4 text-indigo-600" />
+                Human Recruiter Decision & Notes
+              </h4>
+              {selectedCandidate.humanReview && (
+                <span className="text-[10px] font-mono text-indigo-700 bg-white px-2.5 py-0.5 rounded border border-indigo-200">
+                  Reviewed by {selectedCandidate.humanReview.reviewedByName} ·{' '}
+                  {new Date(selectedCandidate.humanReview.reviewedAt).toLocaleString()}
+                </span>
+              )}
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 items-start">
+              <div className="space-y-1.5">
+                <label className="text-[10px] font-semibold uppercase tracking-wider text-slate-600 block">
+                  Recruiter Verdict
+                </label>
+                <div className="grid grid-cols-2 gap-1.5">
+                  {(['Shortlisted', 'On Hold', 'Rejected', 'Hired'] as HumanReviewDecision[]).map((opt) => (
+                    <button
+                      key={opt}
+                      type="button"
+                      onClick={() => setHumanDecision(opt)}
+                      className={`px-2.5 py-1.5 rounded-lg text-[11px] font-semibold border transition-all cursor-pointer ${
+                        humanDecision === opt
+                          ? opt === 'Rejected'
+                            ? 'bg-rose-600 text-white border-rose-700 shadow-2xs'
+                            : opt === 'On Hold'
+                            ? 'bg-amber-500 text-white border-amber-600 shadow-2xs'
+                            : 'bg-emerald-600 text-white border-emerald-700 shadow-2xs'
+                          : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100'
+                      }`}
+                    >
+                      {opt}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="md:col-span-2 space-y-2">
+                <label className="text-[10px] font-semibold uppercase tracking-wider text-slate-600 block">
+                  Human Reviewer Notes / Override Rationale
+                </label>
+                <textarea
+                  value={humanNotes}
+                  onChange={(e) => setHumanNotes(e.target.value)}
+                  rows={2}
+                  maxLength={2000}
+                  placeholder="Add hiring manager feedback, technical verification notes, or reason for overriding AI recommendation..."
+                  className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-800 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
+                />
+                <div className="flex justify-end">
+                  <button
+                    type="button"
+                    disabled={savingHumanReview}
+                    onClick={handleSaveHumanReview}
+                    className="px-4 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-300 text-white text-xs font-semibold transition-colors cursor-pointer"
+                  >
+                    {savingHumanReview ? 'Saving Review...' : 'Save Human Decision'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
           <div className="bg-indigo-50/50 border border-indigo-150 rounded-xl p-4 space-y-2">
             <h4 className="text-xs font-mono uppercase tracking-widest text-indigo-700 flex items-center gap-1.5 font-bold">
               <Sparkles className="w-4 h-4 text-indigo-600" /> AI Core Overview & Suitability Summary

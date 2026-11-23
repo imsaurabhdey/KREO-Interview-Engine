@@ -11,15 +11,53 @@ import { Router } from 'express';
 import { getDb, syncWithFirebase } from '../db';
 import { synthesizeSpeech } from '../ttsService';
 import { sendCandidateEmail } from '../emailService';
-import { requireAuth, requireRole, logAuditEvent } from '../authMiddleware';
+import { requireAuth, requireRole, tryAuthenticateRequest, logAuditEvent } from '../authMiddleware';
+import { createRateLimiter } from '../securityMiddleware';
 
 export const utilityRouter = Router();
 
-// Text-to-Speech Streaming Synthesis Endpoint (used by candidate interview voice)
-utilityRouter.get('/tts', async (req, res) => {
-  const text = req.query.text as string;
-  if (!text || !text.trim()) {
-    return res.status(400).send('Text is required');
+const MAX_TTS_CHARS = 1200;
+
+const ttsRateLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  max: process.env.NODE_ENV === 'test' ? 500 : 60,
+  keyPrefix: 'tts',
+  message: 'Too many speech synthesis requests. Please wait a moment and try again.'
+});
+
+// Text-to-Speech Streaming Synthesis Endpoint (protected by session or active candidate token + length cap)
+utilityRouter.get('/tts', ttsRateLimiter, async (req, res) => {
+  const authUser = tryAuthenticateRequest(req);
+  const tokenParam = typeof req.query.token === 'string' ? req.query.token.trim() : '';
+
+  if (!authUser) {
+    if (!tokenParam) {
+      return res.status(401).json({ error: 'Authentication or an active interview token is required for speech synthesis.' });
+    }
+    const isDemo = tokenParam === 'demo' || tokenParam === 'demo-test-token';
+    if (!isDemo) {
+      const db = getDb();
+      const candidate = db.candidates.find((c) => c.token === tokenParam);
+      if (!candidate) {
+        return res.status(401).json({ error: 'Invalid interview token for speech synthesis.' });
+      }
+      if (candidate.status === 'Completed' || candidate.status === 'Suspended') {
+        return res.status(409).json({ error: 'Interview session is already finalized.' });
+      }
+      if (candidate.tokenExpiresAt && Date.now() > Date.parse(candidate.tokenExpiresAt)) {
+        return res.status(410).json({ error: 'Interview invite link has expired.' });
+      }
+    }
+  }
+
+  const text = typeof req.query.text === 'string' ? req.query.text.trim() : '';
+  if (!text) {
+    return res.status(400).json({ error: 'Text is required.' });
+  }
+  if (text.length > MAX_TTS_CHARS) {
+    return res.status(413).json({
+      error: `Speech synthesis text exceeds maximum limit of ${MAX_TTS_CHARS} characters.`
+    });
   }
 
   try {
@@ -31,7 +69,7 @@ utilityRouter.get('/tts', async (req, res) => {
     res.set({
       'Content-Type': result.mimeType || 'audio/wav',
       'Content-Length': result.buffer.length.toString(),
-      'Cache-Control': 'public, max-age=86400'
+      'Cache-Control': 'private, max-age=3600'
     });
 
     return res.send(result.buffer);

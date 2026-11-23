@@ -543,7 +543,7 @@ export default function CandidateExperience({ token, isDemo, onFinished }: Candi
 
     inflightPreloadsRef.current.add(cleanedText);
     try {
-      const res = await fetch(`/api/tts?text=${encodeURIComponent(cleanedText)}`);
+      const res = await fetch(`/api/tts?token=${encodeURIComponent(token)}&text=${encodeURIComponent(cleanedText)}`);
       if (!res.ok) throw new Error(`TTS fetch failed: ${res.status}`);
       const blob = await res.blob();
       const blobUrl = URL.createObjectURL(blob);
@@ -1998,7 +1998,7 @@ export default function CandidateExperience({ token, isDemo, onFinished }: Candi
         audio = new Audio(cached.blobUrl);
       } else {
         console.log(`[TTS] Streaming speech from endpoint for: "${cleanedText.slice(0, 50)}..."`);
-        const audioUrl = `/api/tts?text=${encodeURIComponent(cleanedText)}`;
+        const audioUrl = `/api/tts?token=${encodeURIComponent(token)}&text=${encodeURIComponent(cleanedText)}`;
         audio = new Audio(audioUrl);
       }
 

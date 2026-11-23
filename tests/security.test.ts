@@ -509,3 +509,116 @@ test('10. Password reset codes are invalidated after 5 failed verification attem
   assert.equal(afterLockoutRes.status, 400);
 });
 
+test('11. Human recruiter review override & invite link re-issuance enforce org scoping and completion locks', async () => {
+  // Invalid decision rejected
+  const badReview = await fetch(`${baseUrl}/api/candidates/cand-active-1/human-review`, {
+    method: 'PUT',
+    headers: {
+      Authorization: `Bearer ${recruiterToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ decision: 'MaybeLater', notes: 'test' })
+  });
+  assert.equal(badReview.status, 400);
+
+  // Cross-org human review rejected (404)
+  const crossOrgReview = await fetch(`${baseUrl}/api/candidates/cand-active-1/human-review`, {
+    method: 'PUT',
+    headers: {
+      Authorization: `Bearer ${otherOrgToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ decision: 'Rejected', notes: 'unauthorized' })
+  });
+  assert.equal(crossOrgReview.status, 404);
+
+  // Valid human review saves decision, notes, reviewer metadata, and syncs selectionStatus
+  const okReview = await fetch(`${baseUrl}/api/candidates/cand-active-1/human-review`, {
+    method: 'PUT',
+    headers: {
+      Authorization: `Bearer ${recruiterToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ decision: 'Shortlisted', notes: 'Strong system design depth in walkthrough.' })
+  });
+  assert.equal(okReview.status, 200);
+  const reviewData = await okReview.json();
+  assert.equal(reviewData.candidate.humanReview.decision, 'Shortlisted');
+  assert.equal(reviewData.candidate.humanReview.reviewedByEmail, 'recruiter@irissoftware.com');
+  assert.equal(reviewData.candidate.selectionStatus, 'Selected');
+
+  // Re-issuing invite on finalized candidate is blocked (409)
+  const reissueCompleted = await fetch(`${baseUrl}/api/candidates/cand-completed-1/reissue-invite`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${recruiterToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ sendEmail: false })
+  });
+  assert.equal(reissueCompleted.status, 409);
+
+  // Re-issuing invite on active/pending candidate rotates token & extends expiry
+  const reissueActive = await fetch(`${baseUrl}/api/candidates/cand-active-1/reissue-invite`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${recruiterToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ sendEmail: false })
+  });
+  assert.equal(reissueActive.status, 200);
+  const reissuedData = await reissueActive.json();
+  assert.notEqual(reissuedData.candidate.token, 'tok-active-1');
+  assert.ok(reissuedData.candidate.token.length >= 36);
+  assert.ok(Date.parse(reissuedData.tokenExpiresAt) > Date.now());
+});
+
+test('12. TTS endpoint requires valid token or session, blocks finalized sessions, and caps text length', async () => {
+  const unauthTts = await fetch(`${baseUrl}/api/tts?text=Hello`);
+  assert.equal(unauthTts.status, 401);
+
+  const invalidTokenTts = await fetch(`${baseUrl}/api/tts?token=tok-fake&text=Hello`);
+  assert.equal(invalidTokenTts.status, 401);
+
+  const completedTokenTts = await fetch(`${baseUrl}/api/tts?token=tok-completed-1&text=Hello`);
+  assert.equal(completedTokenTts.status, 409);
+
+  const tooLongText = 'a'.repeat(1300);
+  const tooLongTts = await fetch(`${baseUrl}/api/tts?text=${tooLongText}`, {
+    headers: { Authorization: `Bearer ${recruiterToken}` }
+  });
+  assert.equal(tooLongTts.status, 413);
+});
+
+test('13. Password strength policy rejects weak passwords on user registration and change-password', async () => {
+  const weakRegister = await fetch(`${baseUrl}/api/auth/register`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${adminToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      name: 'Weak User',
+      email: 'weak@irissoftware.com',
+      password: 'password',
+      role: 'Recruiter'
+    })
+  });
+  assert.equal(weakRegister.status, 400);
+
+  const shortChange = await fetch(`${baseUrl}/api/auth/change-password`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${adminToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      oldPassword: 'AdminPass!123',
+      newPassword: 'Ab1'
+    })
+  });
+  assert.equal(shortChange.status, 400);
+});
+
+

@@ -3303,9 +3303,79 @@ export default function RecruiterPortal({ userRole, userEmail, onLogout }: Recru
                     <h3 className="text-xs font-mono uppercase tracking-widest text-indigo-600 flex items-center gap-1.5 font-bold">
                       <Sparkles className="w-4 h-4 text-indigo-600" /> Candidate Feedback
                     </h3>
-                    <span className="text-[10px] bg-indigo-50 text-indigo-700 px-2 py-0.5 rounded-full font-semibold font-mono">
-                      Total: {candidates.length}
-                    </span>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const escapeCsv = (val: unknown): string => {
+                            const raw = String(val ?? '');
+                            // Prevent spreadsheet formula injection (=, +, -, @)
+                            const safe = /^[=+\-@\t\r]/.test(raw) ? `'${raw}` : raw;
+                            return `"${safe.replace(/"/g, '""')}"`;
+                          };
+                          const headers = [
+                            'Candidate Name',
+                            'Email',
+                            'Phone',
+                            'Assessment Role',
+                            'Interview Status',
+                            'Overall Fitment (%)',
+                            'Technical / Coding (%)',
+                            'Communication (%)',
+                            'AI Decision',
+                            'Human Decision',
+                            'Human Reviewer',
+                            'Human Notes',
+                            'Proctoring Risk',
+                            'Added By',
+                            'Completed At'
+                          ];
+                          const rows = candidates.map((c) => {
+                            const asmt = assessments.find((a) => a.id === c.assessmentId);
+                            const fit = c.status === 'Completed'
+                              ? (c.aiAssessmentScore ?? c.feedbackReport?.technicalScore ?? 0)
+                              : '';
+                            return [
+                              c.name,
+                              c.email,
+                              c.phone || '',
+                              asmt?.title || '',
+                              c.status,
+                              fit,
+                              c.feedbackReport?.technicalScore ?? '',
+                              c.feedbackReport?.communicationScore ?? '',
+                              c.feedbackReport?.decision || '',
+                              c.humanReview?.decision || '',
+                              c.humanReview?.reviewedByName || '',
+                              c.humanReview?.notes || '',
+                              c.feedbackReport?.cheatingRisk || '',
+                              getExactUserName(c.createdByEmail, c.createdByName),
+                              c.completedAt ? new Date(c.completedAt).toISOString() : ''
+                            ].map(escapeCsv).join(',');
+                          });
+                          const csvContent = '\uFEFF' + [headers.map(escapeCsv).join(','), ...rows].join('\r\n');
+                          const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+                          const url = URL.createObjectURL(blob);
+                          const a = document.createElement('a');
+                          a.href = url;
+                          a.download = `kreo_candidate_scorecards_${new Date().toISOString().slice(0, 10)}.csv`;
+                          document.body.appendChild(a);
+                          a.click();
+                          document.body.removeChild(a);
+                          URL.revokeObjectURL(url);
+                          notifyUser(`Exported ${candidates.length} candidate scorecards to CSV.`);
+                        }}
+                        disabled={candidates.length === 0}
+                        className="text-[10px] inline-flex items-center gap-1 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 px-2 py-0.5 rounded font-semibold cursor-pointer disabled:opacity-40"
+                        title="Export all candidate scorecards to CSV"
+                      >
+                        <Download className="w-3 h-3" />
+                        CSV
+                      </button>
+                      <span className="text-[10px] bg-indigo-50 text-indigo-700 px-2 py-0.5 rounded-full font-semibold font-mono">
+                        Total: {candidates.length}
+                      </span>
+                    </div>
                   </div>
 
                   {/* Search Bar */}
@@ -3407,15 +3477,15 @@ export default function RecruiterPortal({ userRole, userEmail, onLogout }: Recru
 
                               {/* Status Badge */}
                               <span className={`text-[8px] font-mono px-2 py-0.5 rounded font-bold shrink-0 border uppercase ${
-                                computedStatus === 'Selected'
+                                (c.humanReview?.decision === 'Hired' || c.humanReview?.decision === 'Shortlisted' || (!c.humanReview && computedStatus === 'Selected'))
                                   ? 'bg-emerald-100 text-emerald-800 border-emerald-200'
-                                  : computedStatus === 'Not Selected'
+                                  : (c.humanReview?.decision === 'Rejected' || (!c.humanReview && computedStatus === 'Not Selected'))
                                   ? 'bg-rose-100 text-rose-800 border-rose-200'
                                   : computedStatus === 'In Progress'
                                   ? 'bg-blue-100 text-blue-800 border-blue-200 animate-pulse'
                                   : 'bg-amber-100 text-amber-800 border-amber-200'
                               }`}>
-                                {computedStatus}
+                                {c.humanReview ? c.humanReview.decision : computedStatus}
                               </span>
                             </div>
 
@@ -3469,6 +3539,10 @@ export default function RecruiterPortal({ userRole, userEmail, onLogout }: Recru
                   onReportTabChange={setReportActiveTab}
                   onForceCompileReport={handleForceCompileReport}
                   onNotifyUser={notifyUser}
+                  onCandidateUpdated={(updated) => {
+                    setCandidates((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
+                    setSelectedCandidate((prev) => (prev?.id === updated.id ? updated : prev));
+                  }}
                 />
               </div>
             </div>
